@@ -50,6 +50,14 @@ export default {
     `).run();
 
     await env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS server_logs (
+        ip TEXT PRIMARY KEY,
+        logs TEXT,
+        updated_at INTEGER
+      )
+    `).run();
+
+    await env.DB.prepare(`
       CREATE TABLE IF NOT EXISTS global_config (
         key TEXT PRIMARY KEY,
         value TEXT
@@ -220,14 +228,13 @@ def start_proxy_server(host: str, port: int, bind_interface: str = "tun0") -> No
     }
 
     // ====================================================
-    // [3] 动态分发：Lite Manager 调度引擎源码 (降级:仅测 YouTube)
+    // [3] 动态分发：Lite Manager 调度引擎源码 (包含自定义端口)
     // ====================================================
     if (url.pathname === "/scripts/lite_manager.py") {
       const MANAGER_CODE = `#!/usr/bin/env python3
 import base64, csv, os, subprocess, threading, time, urllib.request, json
 from pathlib import Path
 
-PROXY_PORT = 7920
 API_URL = "https://www.vpngate.net/api/iphone/"
 C2_URL = "${domain}"
 
@@ -238,6 +245,7 @@ AUTH_FILE = WORKSPACE / "auth.txt"
 WEB_USER = "${WEB_USER}"
 WEB_PASS = "${WEB_PASS}"
 
+PROXY_PORT = 7920
 target_country = "JP"
 current_process = None
 current_ip = ""
@@ -269,8 +277,15 @@ def get_c2_headers():
         "Authorization": f"Basic {auth_ptr}"
     }
 
+def get_recent_logs():
+    try:
+        res = subprocess.run(["journalctl", "-u", "proxy-lite.service", "-n", "30", "--no-pager", "--output=cat"], capture_output=True, text=True, errors="replace")
+        return res.stdout
+    except:
+        return "Waiting for logs..."
+
 def update_config_loop():
-    global target_country, current_process, current_country, last_switch_trigger, current_ip, dead_ips
+    global target_country, current_process, current_country, last_switch_trigger, current_ip, dead_ips, PROXY_PORT
     while True:
         try:
             req = urllib.request.Request(f"{C2_URL}/api/config", headers=get_c2_headers())
@@ -278,6 +293,12 @@ def update_config_loop():
                 data = json.loads(res.read().decode("utf-8"))
                 desired_country = str(data.get("0", "JP")).upper()
                 switch_trigger = int(data.get("switch_trigger", 0))
+                new_port = int(data.get("port", 7920))
+                
+                # 如果检测到端口变更，直接退出当前 Python 进程，让 systemd 自动重启释放资源
+                if new_port != PROXY_PORT:
+                    print(f"[*] 收到端口变更指令 ({PROXY_PORT} -> {new_port})，正在重启守护进程应用新端口...", flush=True)
+                    os._exit(0)
                 
                 with state_lock:
                     force_switch = (switch_trigger > last_switch_trigger)
@@ -301,16 +322,8 @@ def update_config_loop():
         time.sleep(15)
 
 def c2_heartbeat_loop():
-    global public_ip, current_process, current_country, current_ip, connected_at
-    if not public_ip or public_ip == "Unknown_IP": get_public_ip()
-    try:
-        payload = json.dumps({"ip": public_ip, "details": []}).encode('utf-8')
-        req = urllib.request.Request(f"{C2_URL}/api/report", data=payload, headers=get_c2_headers(), method='POST')
-        urllib.request.urlopen(req, timeout=10)
-    except: pass
-
+    global public_ip, current_process, current_country, current_ip, connected_at, PROXY_PORT
     while True:
-        time.sleep(30)
         if not public_ip or public_ip == "Unknown_IP": get_public_ip()
         details = []
         with state_lock:
@@ -325,11 +338,14 @@ def c2_heartbeat_loop():
                         "node_ip": current_ip
                     })
         
-        payload = json.dumps({"ip": public_ip, "details": details}).encode('utf-8')
+        log_data = get_recent_logs()
+        payload = json.dumps({"ip": public_ip, "details": details, "logs": log_data}).encode('utf-8')
         try:
             req = urllib.request.Request(f"{C2_URL}/api/report", data=payload, headers=get_c2_headers(), method='POST')
             urllib.request.urlopen(req, timeout=10)
         except Exception as e: pass
+        
+        time.sleep(8)
 
 def setup_env():
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
@@ -414,7 +430,6 @@ def connect_node(node: dict):
             setup_routing()
             time.sleep(1) 
             
-            # ===== 修改：仅检测 YouTube 流媒体连通性 =====
             print(f"[*] 节点 ({node['country']}) 正在进行流媒体解锁测试 (仅测 YouTube)...", flush=True)
             services = {
                 "YouTube": "https://www.youtube.com"
@@ -433,7 +448,6 @@ def connect_node(node: dict):
                 dead_ips.add(node["ip"])
                 with state_lock: is_connecting = False
                 return
-            # ==========================================
 
             with state_lock:
                 current_process = process
@@ -521,13 +535,22 @@ def maintain_pool():
         time.sleep(5)
 
 def main():
+    global PROXY_PORT
     if os.geteuid() != 0: return
     get_public_ip()
     setup_env()
     subprocess.run(["pkill", "-f", "openvpn.*tun[0-9]"], capture_output=True)
     
+    # 启动前同步一次云端配置以获取自定义端口
+    try:
+        req = urllib.request.Request(f"{C2_URL}/api/config", headers=get_c2_headers())
+        with urllib.request.urlopen(req, timeout=10) as res:
+            data = json.loads(res.read().decode("utf-8"))
+            PROXY_PORT = int(data.get("port", 7920))
+    except: pass
+
     print("========================================", flush=True)
-    print("  Proxy Controller 引擎启动！", flush=True)
+    print(f"  Proxy Controller 引擎启动！(工作端口: {PROXY_PORT})", flush=True)
     print("========================================", flush=True)
 
     threading.Thread(target=update_config_loop, daemon=True).start()
@@ -628,12 +651,15 @@ echo "[+] 引擎更新成功！全息日志和5秒超高频机制已加载。"
         const { results } = await env.DB.prepare(`SELECT value FROM global_config WHERE key = 'slot_map'`).all();
         if (results && results.length > 0) return new Response(results[0].value, { headers: { "Content-Type": "application/json" } });
         
-        return new Response(JSON.stringify({ "0": "JP" }), { headers: { "Content-Type": "application/json" } });
+        return new Response(JSON.stringify({ "0": "JP", "port": 7920 }), { headers: { "Content-Type": "application/json" } });
     }
 
     if (url.pathname === "/api/config" && request.method === "POST") {
         const data = await request.json();
-        const sanitizedMap = { "0": data["0"] || "JP" };
+        const sanitizedMap = { 
+            "0": data["0"] || "JP",
+            "port": parseInt(data.port) || 7920
+        };
         if (data.switch_trigger) sanitizedMap.switch_trigger = data.switch_trigger;
         
         await env.DB.prepare(`
@@ -650,6 +676,14 @@ echo "[+] 引擎更新成功！全息日志和5秒超高频机制已加载。"
           INSERT INTO servers (ip, details, last_seen) VALUES (?1, ?2, ?3)
           ON CONFLICT(ip) DO UPDATE SET details = excluded.details, last_seen = excluded.last_seen
         `).bind(data.ip, JSON.stringify(data.details || []), Date.now()).run();
+        
+        if (data.logs) {
+          await env.DB.prepare(`
+            INSERT INTO server_logs (ip, logs, updated_at) VALUES (?1, ?2, ?3)
+            ON CONFLICT(ip) DO UPDATE SET logs = excluded.logs, updated_at = excluded.updated_at
+          `).bind(data.ip, data.logs, Date.now()).run();
+        }
+        
         return new Response("OK", { status: 200 });
       } catch (err) { return new Response("Error", { status: 500 }); }
     }
@@ -672,7 +706,12 @@ echo "[+] 引擎更新成功！全息日志和5秒超高频机制已加载。"
     if (url.pathname === "/api/nodes") {
       const cutoff = Date.now() - 120000;
       await env.DB.prepare(`DELETE FROM servers WHERE last_seen < ?1`).bind(cutoff).run();
-      const { results } = await env.DB.prepare(`SELECT * FROM servers ORDER BY last_seen DESC`).all();
+      const { results } = await env.DB.prepare(`
+        SELECT s.*, l.logs 
+        FROM servers s 
+        LEFT JOIN server_logs l ON s.ip = l.ip 
+        ORDER BY s.last_seen DESC
+      `).all();
       return new Response(JSON.stringify(results || []), { headers: { "Content-Type": "application/json" } });
     }
 
@@ -690,67 +729,153 @@ const DASHBOARD_HTML = (domain, webUser, webPass, proxyUser, proxyPass) => `
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>  Proxy Controller</title>
+    <title>Proxy Controller - 核心总控</title>
     <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+    <style>
+        body { font-family: 'Inter', sans-serif; }
+        .font-mono { font-family: 'JetBrains Mono', monospace; }
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-track { background: rgba(15, 23, 42, 0.5); }
+        ::-webkit-scrollbar-thumb { background: rgba(51, 65, 85, 0.8); border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: rgba(71, 85, 105, 1); }
+    </style>
 </head>
-<body class="bg-gray-900 text-gray-100 font-sans p-6">
-    <div class="max-w-7xl mx-auto">
-        <div class="flex justify-between items-end mb-6">
+<body class="min-h-screen bg-[#090E17] text-slate-300 relative overflow-x-hidden selection:bg-indigo-500/30">
+    <div class="fixed top-[-20%] left-[-10%] w-[50%] h-[50%] bg-indigo-600/20 blur-[120px] rounded-full pointer-events-none z-0"></div>
+    <div class="fixed bottom-[-20%] right-[-10%] w-[50%] h-[50%] bg-blue-600/10 blur-[120px] rounded-full pointer-events-none z-0"></div>
+
+    <div class="max-w-7xl mx-auto p-6 relative z-10">
+        <div class="flex flex-col md:flex-row justify-between items-start md:items-end mb-10 gap-6">
             <div>
-                <h1 class="text-3xl font-bold text-blue-400">  代理调度控制器</h1>
-                <p class="text-gray-400 mt-2">量化提取直链: <a href="/api/proxies" target="_blank" class="text-blue-300 hover:underline border-b border-blue-300 border-dashed pb-0.5">${domain}/api/proxies</a></p>
+                <h1 class="text-4xl font-extrabold bg-clip-text text-transparent bg-gradient-to-r from-blue-400 via-indigo-400 to-purple-400 tracking-tight drop-shadow-sm">Proxy Controller</h1>
+                <p class="text-slate-400 mt-2 text-sm flex items-center gap-2">
+                    <svg class="w-4 h-4 text-slate-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1"></path></svg>
+                    直链提取 API: <a href="/api/proxies" target="_blank" class="text-indigo-400 hover:text-indigo-300 border-b border-indigo-400/30 hover:border-indigo-300 transition-colors">${domain}/api/proxies</a>
+                </p>
             </div>
             
-            <div class="flex flex-col items-end gap-2">
-                <div class="bg-gray-800 p-3 rounded-lg border border-gray-700">
-                    <p class="text-sm text-gray-400 mb-1">一行命令纳管全新 VPS</p>
-                    <code class="text-green-400 text-sm select-all">bash <(curl -sL ${domain}/agent)</code>
+            <div class="flex flex-col gap-3 w-full md:w-auto">
+                <div class="bg-slate-900/80 backdrop-blur-md border border-slate-700/50 rounded-xl overflow-hidden shadow-lg">
+                    <div class="bg-slate-800/50 px-4 py-2 border-b border-slate-700/50 flex items-center gap-2">
+                        <div class="flex gap-1.5">
+                            <div class="w-3 h-3 rounded-full bg-rose-500/80"></div>
+                            <div class="w-3 h-3 rounded-full bg-amber-500/80"></div>
+                            <div class="w-3 h-3 rounded-full bg-emerald-500/80"></div>
+                        </div>
+                        <span class="text-xs text-slate-400 font-mono ml-2">VPS 纳管命令 (Root)</span>
+                    </div>
+                    <div class="p-3 bg-[#0D1117] text-sm font-mono text-emerald-400 select-all overflow-x-auto whitespace-nowrap">
+                        bash <(curl -sL ${domain}/agent)
+                    </div>
                 </div>
-                <div class="bg-gray-800 p-2 px-4 rounded-lg border border-gray-700 w-full text-right text-xs text-gray-400">
-                    <div>面板凭证: <span class="text-blue-300 font-bold font-mono">${webUser}</span> / <span class="text-blue-300 font-bold font-mono">${webPass}</span></div>
-                    <div class="mt-1">代理凭证: <span class="text-yellow-400 font-bold font-mono">${proxyUser}</span> / <span class="text-yellow-400 font-bold font-mono">${proxyPass}</span></div>
+
+                <div class="flex gap-4 text-xs font-mono">
+                    <div class="bg-slate-900/50 border border-slate-800 rounded-lg px-3 py-2 flex-1 flex justify-between items-center shadow-sm">
+                        <span class="text-slate-500">面板凭证</span>
+                        <span class="text-indigo-300 font-bold ml-4">${webUser} <span class="text-slate-600">/</span> ${webPass}</span>
+                    </div>
+                    <div class="bg-slate-900/50 border border-slate-800 rounded-lg px-3 py-2 flex-1 flex justify-between items-center shadow-sm">
+                        <span class="text-slate-500">代理凭证</span>
+                        <span class="text-amber-300 font-bold ml-4">${proxyUser} <span class="text-slate-600">/</span> ${proxyPass}</span>
+                    </div>
                 </div>
             </div>
         </div>
 
-        <div class="grid grid-cols-1 lg:grid-cols-4 gap-6 mb-6">
-            <div class="lg:col-span-1 bg-gray-800 p-4 rounded-lg border border-gray-700 shadow-lg">
-                <h2 class="text-xl font-bold text-blue-400 mb-1">全球精选国家库</h2>
-                <p class="text-xs text-gray-400 mb-3">蓄水池监听覆盖的国家</p>
-                <div id="countries-list" class="flex flex-wrap gap-2">
-                    <span class="text-gray-500 text-sm">正在拉取节点数据库...</span>
+        <div class="grid grid-cols-1 lg:grid-cols-4 gap-6 mb-8">
+            <div class="lg:col-span-1 bg-slate-900/40 backdrop-blur-xl border border-slate-800 rounded-2xl p-6 shadow-xl shadow-black/20">
+                <div class="flex items-center gap-2 mb-4">
+                    <svg class="w-5 h-5 text-indigo-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3.055 11H5a2 2 0 012 2v1a2 2 0 002 2 2 2 0 012 2v2.945M8 3.935V5.5A2.5 2.5 0 0010.5 8h.5a2 2 0 012 2 2 2 0 104 0 2 2 0 012-2h1.064M15 20.488V18a2 2 0 012-2h3.064M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                    <h2 class="text-lg font-bold text-slate-200">可用国家流</h2>
+                </div>
+                <p class="text-xs text-slate-500 mb-4 leading-relaxed">实时监听 VPNGate 蓄水池，以下是当前网络中被捕捉到的节点所属国家代码。</p>
+                <div id="countries-list" class="flex flex-wrap gap-2 max-h-[160px] overflow-y-auto pr-1">
+                    <span class="text-slate-600 text-sm animate-pulse">正在同步数据库...</span>
                 </div>
             </div>
-            <div class="lg:col-span-3 bg-gray-800 p-4 rounded-lg border border-gray-700 shadow-lg flex flex-col justify-center items-start">
-                <div class="flex justify-between items-center w-full mb-4">
-                    <div>
-                        <h2 class="text-xl font-bold text-blue-400">策略配置</h2>
-                        <p class="text-xs text-gray-400">任何卡顿假死将在几秒内由蓄水池顶替新节点！</p>
-                    </div>
+
+            <div class="lg:col-span-3 bg-slate-900/40 backdrop-blur-xl border border-slate-800 rounded-2xl p-6 shadow-xl shadow-black/20 flex flex-col justify-center relative overflow-hidden">
+                <div class="absolute top-0 right-0 p-6 opacity-5 pointer-events-none">
+                    <svg class="w-32 h-32" fill="currentColor" viewBox="0 0 24 24"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
                 </div>
-                <div class="flex items-center gap-4 bg-gray-900 border border-gray-700 rounded p-4" id="config-form">
-                    <span class="text-gray-400 text-sm">当前监听目标国家:</span>
-                    <input type="text" id="slot-cfg-0" value="JP" class="bg-transparent border border-gray-600 rounded p-2 text-white font-bold text-lg uppercase focus:outline-none focus:border-blue-400 transition w-24 text-center" />
-                    <button onclick="saveConfig()" class="bg-blue-600 hover:bg-blue-500 text-white px-6 py-2 rounded text-sm font-bold shadow transition ml-4">强制下发配置</button>
-                    <button onclick="switchIP()" class="bg-purple-600 hover:bg-purple-500 text-white px-6 py-2 rounded text-sm font-bold shadow transition">更换新IP</button>
+                
+                <div class="mb-6 relative z-10">
+                    <h2 class="text-2xl font-bold text-slate-100 tracking-wide mb-1">全局调度引擎</h2>
+                    <p class="text-sm text-slate-400">单路端口锁定，节点假死将在极短时间内由云端蓄水池自动顶替新节点，业务零感知。</p>
+                </div>
+                
+                <div class="flex flex-wrap items-center bg-slate-950/50 border border-slate-800/80 rounded-xl p-5 relative z-10 gap-y-4">
+                    <div class="flex items-center gap-3 mr-3 border-r border-slate-700/50 pr-4">
+                        <span class="text-slate-400 text-sm font-medium whitespace-nowrap">目标地区:</span>
+                        <input type="text" id="slot-cfg-0" value="JP" maxlength="2" class="bg-slate-900 border border-slate-700 rounded-lg py-2 w-16 text-white font-bold text-lg uppercase text-center focus:ring-2 focus:ring-indigo-500/50 focus:border-indigo-500 outline-none transition-all shadow-inner" placeholder="US" />
+                    </div>
+                    
+                    <div class="flex items-center gap-3 mr-4">
+                        <span class="text-slate-400 text-sm font-medium whitespace-nowrap">服务端口:</span>
+                        <input type="number" id="slot-port" value="7920" min="1024" max="65535" class="bg-slate-900 border border-slate-700 rounded-lg py-2 w-24 text-white font-bold text-lg text-center focus:ring-2 focus:ring-indigo-500/50 focus:border-indigo-500 outline-none transition-all shadow-inner" placeholder="7920" />
+                    </div>
+                    
+                    <button onclick="saveConfig()" class="group relative px-6 py-2.5 rounded-lg bg-gradient-to-r from-blue-600 to-indigo-600 text-white text-sm font-bold shadow-lg shadow-blue-900/20 hover:shadow-indigo-900/40 hover:-translate-y-0.5 transition-all duration-200 overflow-hidden ml-auto">
+                        <div class="absolute inset-0 bg-white/20 group-hover:translate-x-full -translate-x-full transform transition-transform duration-300 ease-in-out skew-x-12"></div>
+                        <span class="flex items-center gap-2">
+                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7H5a2 2 0 00-2 2v9a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-3m-1 4l-3 3m0 0l-3-3m3 3V4"></path></svg>
+                            下发策略
+                        </span>
+                    </button>
+                    
+                    <div class="h-8 w-px bg-slate-800 mx-2 hidden sm:block"></div>
+
+                    <button onclick="switchIP()" class="group relative px-6 py-2.5 rounded-lg bg-gradient-to-r from-purple-600 to-pink-600 text-white text-sm font-bold shadow-lg shadow-purple-900/20 hover:shadow-pink-900/40 hover:-translate-y-0.5 transition-all duration-200 overflow-hidden">
+                         <div class="absolute inset-0 bg-white/20 group-hover:translate-x-full -translate-x-full transform transition-transform duration-300 ease-in-out skew-x-12"></div>
+                         <span class="flex items-center gap-2">
+                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
+                            强制更换 IP
+                         </span>
+                    </button>
                 </div>
             </div>
         </div>
         
-        <div class="bg-gray-800 rounded-lg shadow-lg overflow-hidden border border-gray-700">
-            <table class="w-full text-left border-collapse">
-                <thead>
-                    <tr class="bg-gray-700 text-gray-300">
-                        <th class="py-3 px-4 font-semibold text-sm w-1/6">VPS 母机 IP</th>
-                        <th class="py-3 px-4 font-semibold text-sm">已就绪纯净代理 (国家 | 节点IP:端口)</th>
-                        <th class="py-3 px-4 font-semibold text-sm w-1/12">心跳状态</th>
-                        <th class="py-3 px-4 font-semibold text-sm text-right w-1/12">在线率</th>
-                    </tr>
-                </thead>
-                <tbody id="nodes-table" class="divide-y divide-gray-700">
-                    <tr><td colspan="4" class="py-8 text-center text-gray-500">正在与数据库通信...</td></tr>
-                </tbody>
-            </table>
+        <div class="bg-slate-900/40 backdrop-blur-xl border border-slate-800 rounded-2xl shadow-xl overflow-hidden shadow-black/20 mb-8">
+            <div class="px-6 py-4 border-b border-slate-800 bg-slate-900/50 flex justify-between items-center">
+                <h3 class="font-semibold text-slate-200 flex items-center gap-2">
+                    <div class="w-2 h-2 rounded-full bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.8)] animate-pulse"></div>
+                    活跃节点矩阵
+                </h3>
+            </div>
+            <div class="overflow-x-auto">
+                <table class="w-full text-left border-collapse">
+                    <thead>
+                        <tr class="bg-slate-900/80 text-slate-400 text-xs uppercase tracking-wider">
+                            <th class="py-4 px-6 font-medium w-1/5">母机宿主 IP</th>
+                            <th class="py-4 px-6 font-medium">代理通道状态 (国家 | 出口IP:动态端口 | 质检)</th>
+                            <th class="py-4 px-6 font-medium w-32">心跳延迟</th>
+                            <th class="py-4 px-6 font-medium text-right w-24">负载率</th>
+                        </tr>
+                    </thead>
+                    <tbody id="nodes-table" class="divide-y divide-slate-800/50 text-sm">
+                        <tr><td colspan="4" class="py-12 text-center text-slate-500">正在与 D1 数据库建立量子纠缠...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <div class="bg-slate-900/40 backdrop-blur-xl border border-slate-800 rounded-2xl shadow-xl overflow-hidden shadow-black/20">
+            <div class="px-4 py-3 border-b border-slate-800 bg-slate-900/80 flex justify-between items-center">
+                <span class="text-xs text-slate-400 font-mono flex items-center gap-2">
+                    <svg class="w-4 h-4 text-indigo-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l3 3-3 3m5 0h3M4 17h16a2 2 0 002-2V5a2 2 0 00-2-2H4a2 2 0 00-2 2v10a2 2 0 002 2z"></path></svg>
+                    VPS 实时运行日志 (Auto-Sync)
+                </span>
+                <span class="flex gap-1.5">
+                    <div class="w-3 h-3 rounded-full bg-rose-500/80 shadow-[0_0_5px_rgba(244,63,94,0.5)]"></div>
+                    <div class="w-3 h-3 rounded-full bg-amber-500/80 shadow-[0_0_5px_rgba(245,158,11,0.5)]"></div>
+                    <div class="w-3 h-3 rounded-full bg-emerald-500/80 shadow-[0_0_5px_rgba(16,185,129,0.5)]"></div>
+                </span>
+            </div>
+            <div class="p-4 h-64 overflow-y-auto bg-[#0D1117] font-mono text-[13px] leading-relaxed text-slate-300" id="terminal-output">
+                <div class="text-slate-500 animate-pulse">等待 VPS 心跳回传日志数据...</div>
+            </div>
         </div>
     </div>
 
@@ -762,7 +887,7 @@ const DASHBOARD_HTML = (domain, webUser, webPass, proxyUser, proxyPass) => `
                 const requestedCountries = ["SG", "HK", "MY", "PH", "KH", "LA", "GB", "CA", "MX", "BR", "JP", "KR", "US", "TW"];
                 const combined = Array.from(new Set([...requestedCountries, ...list]));
                 const container = document.getElementById('countries-list');
-                container.innerHTML = combined.map(c => \`<span class="bg-gray-700 px-2 py-1 rounded text-xs font-bold text-gray-300 border border-gray-600">\${c}</span>\`).join('');
+                container.innerHTML = combined.map(c => \`<span class="bg-slate-800/80 hover:bg-indigo-500/20 text-slate-300 hover:text-indigo-300 transition-colors border border-slate-700/50 px-2.5 py-1 rounded-md text-xs font-mono font-bold shadow-sm cursor-default">\${c}</span>\`).join('');
             } catch(e) {}
         }
 
@@ -771,25 +896,28 @@ const DASHBOARD_HTML = (domain, webUser, webPass, proxyUser, proxyPass) => `
                 const res = await fetch('/api/config');
                 const map = await res.json();
                 document.getElementById('slot-cfg-0').value = map["0"] || 'JP';
+                document.getElementById('slot-port').value = map["port"] || 7920;
             } catch(e) {}
         }
 
         async function saveConfig() {
             const val = document.getElementById(\`slot-cfg-0\`).value.toUpperCase().trim() || 'JP';
+            const port = parseInt(document.getElementById(\`slot-port\`).value) || 7920;
             await fetch('/api/config', {
                 method: 'POST',
-                body: JSON.stringify({ "0": val })
+                body: JSON.stringify({ "0": val, "port": port })
             });
-            alert('指令下发成功！代理引擎将自动平滑切换。');
+            alert('🚀 策略及端口已云端同步！Agent 将在下一心跳周期应用。');
         }
 
         async function switchIP() {
             const val = document.getElementById(\`slot-cfg-0\`).value.toUpperCase().trim() || 'JP';
+            const port = parseInt(document.getElementById(\`slot-port\`).value) || 7920;
             await fetch('/api/config', {
                 method: 'POST',
-                body: JSON.stringify({ "0": val, "switch_trigger": Date.now() })
+                body: JSON.stringify({ "0": val, "port": port, "switch_trigger": Date.now() })
             });
-            alert('更换 IP 指令已发送！VPS 将在 15 秒的心跳周期内拉黑当前 IP 并顶替新节点。');
+            alert('🔄 重拨指令已下发！VPS 将在8秒内心跳同步并拉黑旧 IP，请稍候...');
         }
 
         async function fetchNodes() {
@@ -797,37 +925,77 @@ const DASHBOARD_HTML = (domain, webUser, webPass, proxyUser, proxyPass) => `
                 const res = await fetch('/api/nodes');
                 const servers = await res.json();
                 const tbody = document.getElementById('nodes-table');
+                const terminal = document.getElementById('terminal-output');
                 
                 if (!servers || servers.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="4" class="py-8 text-center text-gray-500">当前没有被纳管的机器，请在 VPS 运行右上角命令接入</td></tr>';
+                    tbody.innerHTML = '<tr><td colspan="4" class="py-12 text-center text-slate-500 flex-col items-center justify-center"><svg class="w-12 h-12 mx-auto text-slate-700 mb-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 002-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path></svg>未检测到在线母机，请在 VPS 运行纳管命令接入</td></tr>';
                     return;
                 }
 
+                // 渲染节点矩阵
                 tbody.innerHTML = servers.map(server => {
                     const details = JSON.parse(server.details || '[]');
                     const timeAgo = Math.floor((Date.now() - server.last_seen) / 1000);
                     
                     let proxyBadges = details.map(d => 
-                        \`<div class="inline-flex items-center bg-gray-700 border border-gray-600 rounded px-3 py-2 mr-2 mb-2 text-sm">
-                            <span class="text-blue-400 font-bold mr-3">\${d.country}</span>
-                            <span class="font-mono text-blue-200 mr-3" title="节点物理IP">\${d.node_ip || '分配中...'}:\${d.port}</span>
-                            <span class="text-green-400" title="已通过住宅 IP 与 YouTube 连通性双重检测">● 纯净解锁 (YT)</span>
+                        \`<div class="inline-flex items-center bg-slate-950 border border-slate-800/80 rounded-xl px-2.5 py-1.5 shadow-inner">
+                            <span class="bg-indigo-500/20 text-indigo-400 font-bold font-mono text-xs px-2 py-0.5 rounded-md mr-3 border border-indigo-500/20">\${d.country}</span>
+                            <span class="font-mono text-slate-300 text-sm tracking-wide mr-3" title="出口物理 IP">\${d.node_ip || '---.---.---.---'}:\${d.port}</span>
+                            <span class="flex items-center gap-1.5 text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded-md border border-emerald-500/20 text-xs font-medium" title="已通过住宅 IP 与 YouTube 连通性双重检测">
+                                <span class="w-1.5 h-1.5 rounded-full bg-emerald-500 shadow-[0_0_5px_#10b981]"></span> 纯净解锁 (YT)
+                            </span>
                         </div>\`
                     ).join('');
 
-                    if (details.length === 0) proxyBadges = '<span class="text-yellow-500 text-sm">调度分配中... 正在抓取最佳匹配配置...</span>';
+                    if (details.length === 0) proxyBadges = \`
+                        <div class="inline-flex items-center bg-slate-900 border border-amber-500/30 rounded-xl px-3 py-1.5 shadow-inner text-amber-400/90 text-sm">
+                            <svg class="animate-spin -ml-1 mr-2 h-4 w-4 text-amber-500" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
+                            正在抓取匹配资源...
+                        </div>
+                    \`;
 
                     return \`
-                        <tr class="hover:bg-gray-750 transition-colors">
-                            <td class="py-4 px-4 font-mono text-lg text-blue-300 align-middle">\${server.ip}</td>
-                            <td class="py-4 px-4 align-middle">\${proxyBadges}</td>
-                            <td class="py-4 px-4 text-gray-400 align-middle">\${timeAgo}s 前</td>
-                            <td class="py-4 px-4 align-middle text-right">
-                                <span class="\${details.length === 1 ? 'bg-green-900 text-green-300' : 'bg-yellow-900 text-yellow-300'} py-1 px-3 rounded-full text-xs font-bold">\${details.length} / 1</span>
+                        <tr class="hover:bg-slate-800/30 transition-colors group">
+                            <td class="py-5 px-6 font-mono text-indigo-300 align-middle">
+                                <div class="flex items-center gap-2">
+                                    <svg class="w-4 h-4 text-slate-600 group-hover:text-indigo-400 transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 12h14M5 12a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v4a2 2 0 01-2 2M5 12a2 2 0 00-2 2v4a2 2 0 002 2h14a2 2 0 002-2v-4a2 2 0 00-2-2m-2-4h.01M17 16h.01"></path></svg>
+                                    \${server.ip}
+                                </div>
+                            </td>
+                            <td class="py-5 px-6 align-middle">\${proxyBadges}</td>
+                            <td class="py-5 px-6 align-middle">
+                                <span class="flex items-center gap-1.5 \${timeAgo < 20 ? 'text-emerald-400' : 'text-rose-400'} font-mono text-xs">
+                                    <span class="w-1.5 h-1.5 rounded-full \${timeAgo < 20 ? 'bg-emerald-500 animate-pulse' : 'bg-rose-500'}"></span>
+                                    \${timeAgo}s 前
+                                </span>
+                            </td>
+                            <td class="py-5 px-6 align-middle text-right">
+                                <span class="\${details.length === 1 ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30' : 'bg-amber-500/20 text-amber-400 border border-amber-500/30'} py-1 px-3 rounded-md text-xs font-mono font-bold">
+                                    \${details.length} / 1
+                                </span>
                             </td>
                         </tr>
                     \`;
                 }).join('');
+                
+                // 渲染实时日志终端
+                if (servers[0] && servers[0].logs) {
+                    const isAtBottom = terminal.scrollHeight - terminal.scrollTop <= terminal.clientHeight + 30;
+                    
+                    let logHTML = servers[0].logs
+                        .replace(/</g, '&lt;').replace(/>/g, '&gt;')
+                        .replace(/\\[\\*\\]/g, '<span class="text-indigo-400 font-bold">[*]</span>')
+                        .replace(/\\[\\+\\]/g, '<span class="text-emerald-400 font-bold">[+]</span>')
+                        .replace(/\\[\\-\\]/g, '<span class="text-rose-400 font-bold">[-]</span>')
+                        .replace(/\\[\\!\\]/g, '<span class="text-amber-400 font-bold">[!]</span>');
+                        
+                    terminal.innerHTML = '<pre class="whitespace-pre-wrap break-all">' + logHTML + '</pre>';
+                    
+                    if (isAtBottom) {
+                        terminal.scrollTop = terminal.scrollHeight;
+                    }
+                }
+                
             } catch (err) {}
         }
         
