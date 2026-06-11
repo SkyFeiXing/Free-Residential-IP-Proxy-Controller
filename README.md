@@ -26,7 +26,7 @@ wget -N https://gitlab.com/fscarmen/warp/-/raw/main/menu.sh && bash menu.sh
 <img width="3715" height="1759" alt="图片" src="https://github.com/user-attachments/assets/2877288a-d969-475f-92b1-18ceef651273" />
 <img width="3715" height="1759" alt="图片" src="https://github.com/user-attachments/assets/c8df6abe-029a-4b55-ad25-d367257ccec2" />
 
-> **致谢**：本项目的原生 IP 深度质检与风险评分感知模块，由 [TestISP.info](https://testisp.info) (企业级资产测绘与环境自检沙箱) 提供 API 支持。
+> **致谢**：本项目的原生 IP 深度质检与风险评分感知模块，由 [TestISP.info](https://testisp.info) (商业级住宅IP与本地环境检测沙箱平台) 提供 API 支持。
 
 ---
 
