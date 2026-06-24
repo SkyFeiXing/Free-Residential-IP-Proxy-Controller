@@ -252,9 +252,17 @@ target_country = "JP"
 last_switch_trigger = 0  
 
 state_lock = threading.Lock()
-dead_ips = set()
+dead_ips = {}  # country -> set(ip)：按国家分桶黑名单（#2 熔断仅清当前国家，避免核弹级副作用）
 last_blacklist_clear = time.time()
 public_ip = ""
+
+# #1 彻底淘汰机制：节点被熔断释放次数累计达阈值后，从蓄水池永久移除，打破死循环
+node_release_count = {}
+FATAL_RELEASE_THRESHOLD = 3
+
+# #5 熔断日志节流：同一国家冷却期内仅打印一次，避免日志噪音淹没真实故障信号
+last_breaker_log = {}
+BREAKER_LOG_COOLDOWN = 60
 
 global_node_reservoir = {} 
 reservoir_lock = threading.Lock()
@@ -284,6 +292,19 @@ def penalize_node(ip: str, penalty: int):
     with reservoir_lock:
         if ip in global_node_reservoir:
             global_node_reservoir[ip]["ping"] += penalty
+
+def blacklist_node(ip: str, country: str = ""):
+    """
+    将节点加入其所属国家的分桶黑名单（#2）。
+    优先使用传入的 country；未提供时回退从蓄水池查询节点归属国家。
+    """
+    c = (country or "").upper()
+    if not c:
+        with reservoir_lock:
+            node = global_node_reservoir.get(ip)
+            if node: c = (node.get("country") or "").upper()
+    if c:
+        dead_ips.setdefault(c, set()).add(ip)
 
 def get_public_ip():
     global public_ip
@@ -328,7 +349,7 @@ def update_config_loop():
                         if force_switch: print(f"[*] 收到强制更换指令，正在清退通道并拉黑当前 IP...", flush=True)
                         else: print(f"[*] 策略热切换: 目标重定向到 {desired_country}...", flush=True)
                         
-                        if tun_main.entry_ip: dead_ips.add(tun_main.entry_ip)
+                        if tun_main.entry_ip: blacklist_node(tun_main.entry_ip, tun_main.country)
                         if tun_main.process:
                             try: tun_main.process.terminate(); tun_main.process.wait(2)
                             except: tun_main.process.kill()
@@ -405,6 +426,9 @@ def vpngate_fetch_loop():
         if snapshot:
             with reservoir_lock:
                 for n in snapshot:
+                    # #1 已被彻底淘汰的节点不再回收（即使快照中再次出现）
+                    if node_release_count.get(n["ip"], 0) >= FATAL_RELEASE_THRESHOLD:
+                        continue
                     # 保留原有的惩罚性 ping 值，防止坏节点被新抓取的快照刷新后又跑到前列去
                     if n["ip"] in global_node_reservoir:
                         n["ping"] = max(n["ping"], global_node_reservoir[n["ip"]]["ping"])
@@ -482,7 +506,7 @@ def connect_node(tun: Tunnel, node: dict):
             if not is_residential:
                 print(f"[-] {tun.name} 节点出口 ({egress_ip}) 检测为机房 IP，残忍抛弃！", flush=True)
                 penalize_node(node["ip"], 50000)  # 机房 IP 极重惩罚，几乎不再启用
-                dead_ips.add(node["ip"])
+                blacklist_node(node["ip"], node["country"])
                 try: process.terminate(); process.wait(2)
                 except: process.kill()
                 return
@@ -492,7 +516,7 @@ def connect_node(tun: Tunnel, node: dict):
             if res.returncode != 0:
                 print(f"[-] {tun.name} 节点出口无法连通 YouTube，拉黑更换: {node['ip']}", flush=True)
                 penalize_node(node["ip"], 10000)  # YT 连不通重罚
-                dead_ips.add(node["ip"])
+                blacklist_node(node["ip"], node["country"])
                 try: process.terminate(); process.wait(2)
                 except: process.kill()
                 return
@@ -511,7 +535,7 @@ def connect_node(tun: Tunnel, node: dict):
             penalize_node(node["ip"], 5000)  # 建连超时中度惩罚
             try: process.terminate(); process.wait(2)
             except: process.kill()
-            dead_ips.add(node["ip"])
+            blacklist_node(node["ip"], node["country"])
     finally:
         with state_lock: tun.is_connecting = False
 
@@ -564,7 +588,7 @@ def health_check_loop():
             if fail_count >= 3:
                 print(f"[!] {target_tun} 连续 {fail_count} 次多维探针(HTTP/ICMP)均无响应，确认为真死断流，执行踢线: {target_entry_ip}", flush=True)
                 penalize_node(target_entry_ip, 3000) # 运行中死掉的节点给予轻中度惩罚
-                dead_ips.add(target_entry_ip)
+                blacklist_node(target_entry_ip, tun_main.country)
                 try: proc_ref.terminate(); proc_ref.wait(timeout=2)
                 except: proc_ref.kill()
                 with state_lock:
@@ -577,9 +601,10 @@ def health_check_loop():
 
 def get_best_candidate():
     global global_node_reservoir, dead_ips, target_country, tun_main, tun_backup
+    global node_release_count, last_breaker_log
     with reservoir_lock:
         all_pool_nodes = sorted(list(global_node_reservoir.values()), key=lambda x: x["ping"])
-        candidates = [n for n in all_pool_nodes if n["country"] == target_country and n["ip"] not in dead_ips]
+        candidates = [n for n in all_pool_nodes if n["country"] == target_country and n["ip"] not in dead_ips.get(n["country"], set())]
         
         active_ips = []
         if tun_main.entry_ip: active_ips.append(tun_main.entry_ip)
@@ -589,9 +614,25 @@ def get_best_candidate():
         if not candidates:
             has_blacklisted = any(n["country"] == target_country for n in all_pool_nodes)
             if has_blacklisted:
-                dead_ips.clear()
-                print(f"[!] ⚡ 紧急熔断：[{target_country}] 节点黑名单释放救场（由于动态信誉系统存在，历史坏节点将被沉底）", flush=True)
-                candidates = [n for n in all_pool_nodes if n["country"] == target_country and n["ip"] not in active_ips]
+                # #2 仅释放当前国家的黑名单（不再核弹级清空全部国家）
+                released = dead_ips.pop(target_country, set())
+                # #1 对被释放的节点累计熔断次数，达阈值则从蓄水池彻底淘汰，打破死循环
+                for ip in released:
+                    node_release_count[ip] = node_release_count.get(ip, 0) + 1
+                fatal_ips = [ip for ip, cnt in node_release_count.items() if cnt >= FATAL_RELEASE_THRESHOLD]
+                for ip in fatal_ips:
+                    global_node_reservoir.pop(ip, None)
+                    node_release_count.pop(ip, None)
+                if fatal_ips:
+                    print(f"[!] 💀 [{target_country}] 彻底淘汰 {len(fatal_ips)} 个反复失效节点（累计熔断≥{FATAL_RELEASE_THRESHOLD}次），已从蓄水池永久移除", flush=True)
+                # #5 熔断日志节流：同一国家冷却期内仅打印一次
+                now = time.time()
+                if now - last_breaker_log.get(target_country, 0) > BREAKER_LOG_COOLDOWN:
+                    print(f"[!] ⚡ 紧急熔断：[{target_country}] 节点黑名单释放救场（由于动态信誉系统存在，历史坏节点将被沉底）", flush=True)
+                    last_breaker_log[target_country] = now
+                # 重新基于当前蓄水池快照筛选候选（已淘汰节点自然不在其中）
+                candidates = [n for n in global_node_reservoir.values() if n["country"] == target_country and n["ip"] not in active_ips]
+                candidates.sort(key=lambda x: x["ping"])
 
         if candidates: return candidates.pop(0)
     return None
