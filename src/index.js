@@ -11,15 +11,30 @@ export default {
     const PROXY_USER = env.PROXY_USER || "proxy";    
     const PROXY_PASS = env.PROXY_PASS || "888888";   
 
+    // #5 常量时间字符串比较，防止时序侧信道逐字符爆破
+    const timingSafeEqual = (a, b) => {
+      const ea = new TextEncoder().encode(String(a));
+      const eb = new TextEncoder().encode(String(b));
+      if (ea.length !== eb.length) return false;
+      let diff = 0;
+      for (let i = 0; i < ea.length; i++) diff |= ea[i] ^ eb[i];
+      return diff === 0;
+    };
+
     const authenticate = (request) => {
+      // #4 拒绝默认弱口令，强制部署者修改 WEB_USER/WEB_PASS 环境变量
+      if (WEB_USER === "admin" && WEB_PASS === "admin888") return false;
       const authHeader = request.headers.get("Authorization");
       if (!authHeader) return false;
       const [scheme, encoded] = authHeader.split(" ");
       if (scheme !== "Basic") return false;
       try {
         const decoded = atob(encoded);
-        const [username, password] = decoded.split(":");
-        return username === WEB_USER && password === WEB_PASS;
+        const idx = decoded.indexOf(":");
+        if (idx < 0) return false;
+        const username = decoded.slice(0, idx);
+        const password = decoded.slice(idx + 1);
+        return timingSafeEqual(username, WEB_USER) && timingSafeEqual(password, WEB_PASS);
       } catch (e) {
         return false;
       }
@@ -61,7 +76,7 @@ export default {
     if (url.pathname === "/scripts/proxy_server.py") {
       const PROXY_CODE = `#!/usr/bin/env python3
 from __future__ import annotations
-import select, socket, threading, urllib.parse, time, base64
+import select, socket, threading, urllib.parse, time, base64, hmac
 from typing import Any
 
 PROXY_USER = b"${PROXY_USER}"
@@ -131,7 +146,7 @@ def socks5_client(client: socket.socket, first_byte: bytes) -> None:
         plen = recv_exact(client, 1)[0]
         upass = recv_exact(client, plen)
         
-        if uname != PROXY_USER or upass != PROXY_PASS:
+        if not (hmac.compare_digest(uname, PROXY_USER) and hmac.compare_digest(upass, PROXY_PASS)):
             client.sendall(b"\\x01\\x01") 
             return
         client.sendall(b"\\x01\\x00") 
@@ -167,7 +182,7 @@ def http_client(client: socket.socket, first_byte: bytes) -> None:
         auth_passed = False
         for line in lines[1:]:
             if line.lower().startswith("proxy-authorization:"):
-                if line.split(":", 1)[1].strip() == expected_auth:
+                if hmac.compare_digest(line.split(":", 1)[1].strip(), expected_auth):
                     auth_passed = True
                     break
                     
@@ -279,6 +294,7 @@ class Tunnel:
         self.ready = False
         self.connected_at = 0
         self.is_connecting = False
+        self.generation = 0  # #3 代际标记：隧道身份对调时递增，使进行中的 connect_node 写入失效
 
 tun_main = Tunnel("tun_main", 101)
 tun_backup = Tunnel("tun_backup", 102)
@@ -299,12 +315,13 @@ def blacklist_node(ip: str, country: str = ""):
     优先使用传入的 country；未提供时回退从蓄水池查询节点归属国家。
     """
     c = (country or "").upper()
-    if not c:
-        with reservoir_lock:
+    # #2 统一用 reservoir_lock 保护 dead_ips，消除跨线程读写竞态
+    with reservoir_lock:
+        if not c:
             node = global_node_reservoir.get(ip)
             if node: c = (node.get("country") or "").upper()
-    if c:
-        dead_ips.setdefault(c, set()).add(ip)
+        if c:
+            dead_ips.setdefault(c, set()).add(ip)
 
 def get_public_ip():
     global public_ip
@@ -446,6 +463,7 @@ def setup_routing(tun_name: str, table_id: int):
 
 def connect_node(tun: Tunnel, node: dict):
     global dead_ips
+    my_gen = tun.generation  # #3 记录当前代际，隧道对调后用于使本次写入失效
     try:
         cfg_path = CONFIG_DIR / f"{tun.name}.ovpn"
         log_file = WORKSPACE / f"{tun.name}_err.log"
@@ -521,16 +539,28 @@ def connect_node(tun: Tunnel, node: dict):
                 except: process.kill()
                 return
 
+            # #3 代际校验：隧道对调后身份变更则放弃写入，避免幽灵隧道
             with state_lock:
-                tun.process = process
-                tun.node = node
-                tun.entry_ip = node["ip"]
-                tun.egress_ip = egress_ip
-                tun.country = node["country"]
-                tun.connected_at = time.time()
-                tun.ready = True
-            role = "主网卡" if proxy_server.ACTIVE_BIND == tun.name else "备用网卡"
-            print(f"[+] {tun.name} ({role}) 完全就绪: 入口 {node['ip']} -> 出口 {egress_ip}", flush=True)
+                if tun.generation != my_gen:
+                    stale = True
+                else:
+                    stale = False
+                    tun.process = process
+                    tun.node = node
+                    tun.entry_ip = node["ip"]
+                    tun.egress_ip = egress_ip
+                    tun.country = node["country"]
+                    tun.connected_at = time.time()
+                    tun.ready = True
+            if stale:
+                print(f"[!] {tun.name} 连接完成但代际已变更（隧道身份对调），丢弃结果避免幽灵隧道", flush=True)
+                try: process.terminate(); process.wait(2)
+                except:
+                    try: process.kill()
+                    except: pass
+            else:
+                role = "主网卡" if proxy_server.ACTIVE_BIND == tun.name else "备用网卡"
+                print(f"[+] {tun.name} ({role}) 完全就绪: 入口 {node['ip']} -> 出口 {egress_ip}", flush=True)
         else:
             penalize_node(node["ip"], 5000)  # 建连超时中度惩罚
             try: process.terminate(); process.wait(2)
@@ -542,24 +572,31 @@ def connect_node(tun: Tunnel, node: dict):
 def health_check_loop():
     global tun_main, dead_ips
     fail_count = 0
+    last_checked_ip = ""  # #6 跟踪当前检测的隧道身份，对调/重连后重置容错窗口
     while True:
         # 如果处于异常容错状态，缩短检测间隔进行快速复核
         time.sleep(15 if fail_count == 0 else 5)
-        
+
         target_tun = ""
         target_entry_ip = ""
         proc_ref = None
-        
+
         with state_lock:
             if tun_main.ready and tun_main.process and tun_main.process.poll() is None:
                 if time.time() - tun_main.connected_at > 20:
                     target_tun = tun_main.name
                     target_entry_ip = tun_main.entry_ip
                     proc_ref = tun_main.process
-        
+
         if not target_tun:
             fail_count = 0
+            last_checked_ip = ""
             continue
+
+        # #6 隧道身份变化（对调或重连）时重置 fail_count，避免新主隧道被过早踢线
+        if target_entry_ip != last_checked_ip:
+            fail_count = 0
+            last_checked_ip = target_entry_ip
             
         # 1. 应用层：多维 HTTP 探针 (包含域名与直连IP，规避单点限流和DNS污染)
         endpoints = [
@@ -640,53 +677,59 @@ def get_best_candidate():
 def maintain_pool():
     global dead_ips, last_blacklist_clear, tun_main, tun_backup
     while True:
-        if time.time() - last_blacklist_clear > 600:
-            dead_ips.clear()
-            last_blacklist_clear = time.time()
+        try:
+            if time.time() - last_blacklist_clear > 600:
+                # #2 dead_ips 清理也纳入 reservoir_lock，消除与 blacklist_node 的并发竞态
+                with reservoir_lock:
+                    dead_ips.clear()
+                last_blacklist_clear = time.time()
 
-        with reservoir_lock:
-            now = time.time()
-            stale_ips = [ip for ip, node in global_node_reservoir.items() if now - node["harvested_at"] > 10800]
-            for ip in stale_ips: global_node_reservoir.pop(ip, None)
+            with reservoir_lock:
+                now = time.time()
+                stale_ips = [ip for ip, node in global_node_reservoir.items() if now - node["harvested_at"] > 10800]
+                for ip in stale_ips: global_node_reservoir.pop(ip, None)
 
-        with state_lock:
-            main_dead = (tun_main.process is None or tun_main.process.poll() is not None or not tun_main.ready)
-            if main_dead:
-                if tun_backup.ready and tun_backup.process and tun_backup.process.poll() is None:
-                    print(f"[*] ⚡ 主通道暴毙，软开关秒切！无缝接管业务至备用通道: 出口 {tun_backup.egress_ip or tun_backup.entry_ip}", flush=True)
-                    # 状态互换 (身份对调)
-                    tun_main, tun_backup = tun_backup, tun_main
-                    proxy_server.ACTIVE_BIND = tun_main.name
-                    
-                    # 异步清理死掉的旧主卡 (现在的 tun_backup)
-                    if tun_backup.process:
-                        try: tun_backup.process.terminate(); tun_backup.process.wait(2)
-                        except: tun_backup.process.kill()
-                    tun_backup.process = None; tun_backup.node = None; tun_backup.entry_ip = ""; tun_backup.egress_ip = ""
-                    tun_backup.ready = False; tun_backup.is_connecting = False
-                else:
-                    if tun_main.process:
-                        try: tun_main.process.terminate(); tun_main.process.wait(2)
-                        except: tun_main.process.kill()
-                    tun_main.process = None; tun_main.ready = False; tun_main.is_connecting = False
-                    tun_main.entry_ip = ""; tun_main.egress_ip = ""
+            with state_lock:
+                main_dead = (tun_main.process is None or tun_main.process.poll() is not None or not tun_main.ready)
+                if main_dead:
+                    if tun_backup.ready and tun_backup.process and tun_backup.process.poll() is None:
+                        print(f"[*] ⚡ 主通道暴毙，软开关秒切！无缝接管业务至备用通道: 出口 {tun_backup.egress_ip or tun_backup.entry_ip}", flush=True)
+                        # 状态互换 (身份对调)
+                        tun_main, tun_backup = tun_backup, tun_main
+                        proxy_server.ACTIVE_BIND = tun_main.name
 
-        with state_lock:
-            needs_main = not tun_main.ready and not tun_main.is_connecting
-            needs_backup = not tun_backup.ready and not tun_backup.is_connecting
+                        # 异步清理死掉的旧主卡 (现在的 tun_backup)
+                        if tun_backup.process:
+                            try: tun_backup.process.terminate(); tun_backup.process.wait(2)
+                            except: tun_backup.process.kill()
+                        tun_backup.process = None; tun_backup.node = None; tun_backup.entry_ip = ""; tun_backup.egress_ip = ""
+                        tun_backup.ready = False; tun_backup.is_connecting = False
+                        tun_backup.generation += 1  # #3 递增代际，使进行中的 connect_node 放弃写入
+                    else:
+                        if tun_main.process:
+                            try: tun_main.process.terminate(); tun_main.process.wait(2)
+                            except: tun_main.process.kill()
+                        tun_main.process = None; tun_main.ready = False; tun_main.is_connecting = False
+                        tun_main.entry_ip = ""; tun_main.egress_ip = ""
 
-        if needs_main:
-            node = get_best_candidate()
-            if node:
-                with state_lock: tun_main.is_connecting = True
-                threading.Thread(target=connect_node, args=(tun_main, node,), daemon=True).start()
-                time.sleep(1)
-        elif needs_backup:
-            node = get_best_candidate()
-            if node:
-                with state_lock: tun_backup.is_connecting = True
-                threading.Thread(target=connect_node, args=(tun_backup, node,), daemon=True).start()
+            with state_lock:
+                needs_main = not tun_main.ready and not tun_main.is_connecting
+                needs_backup = not tun_backup.ready and not tun_backup.is_connecting
 
+            if needs_main:
+                node = get_best_candidate()
+                if node:
+                    with state_lock: tun_main.is_connecting = True
+                    threading.Thread(target=connect_node, args=(tun_main, node,), daemon=True).start()
+                    time.sleep(1)
+            elif needs_backup:
+                node = get_best_candidate()
+                if node:
+                    with state_lock: tun_backup.is_connecting = True
+                    threading.Thread(target=connect_node, args=(tun_backup, node,), daemon=True).start()
+        except Exception as e:
+            # #1 兜底保护：任何异常都不让核心调度线程死亡（否则系统进入无告警的僵尸态）
+            print(f"[!] maintain_pool 异常（已捕获，继续运行）: {type(e).__name__}: {e}", flush=True)
         time.sleep(2)
 
 def main():
@@ -1067,6 +1110,8 @@ const DASHBOARD_HTML = (domain, webUser, webPass, proxyUser, proxyPass) => `
     </div>
 
     <script>
+        // #9 HTML 转义：所有来自 D1/外部 API 的数据渲染前必须经过 esc()，防止存储型 XSS
+        const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
         let currentScoreIp = "";
 
         async function fetchCountries() {
@@ -1074,7 +1119,7 @@ const DASHBOARD_HTML = (domain, webUser, webPass, proxyUser, proxyPass) => `
                 const res = await fetch('/api/countries');
                 const list = await res.json();
                 const container = document.getElementById('countries-list');
-                container.innerHTML = list.map(c => \`<span class="bg-slate-800/80 hover:bg-indigo-500/20 text-slate-300 hover:text-indigo-300 transition-colors border border-slate-700/50 px-2.5 py-1 rounded-md text-xs font-mono font-bold shadow-sm cursor-default">\${c}</span>\`).join('');
+                container.innerHTML = list.map(c => \`<span class="bg-slate-800/80 hover:bg-indigo-500/20 text-slate-300 hover:text-indigo-300 transition-colors border border-slate-700/50 px-2.5 py-1 rounded-md text-xs font-mono font-bold shadow-sm cursor-default">\${esc(c)}</span>\`).join('');
             } catch(e) {}
         }
 
@@ -1124,7 +1169,7 @@ const DASHBOARD_HTML = (domain, webUser, webPass, proxyUser, proxyPass) => `
                 }
                 
                 if (!d || !d.geo || !d.isp) {
-                    container.innerHTML = \`<div class="col-span-full text-center py-8 text-rose-400 bg-rose-500/10 rounded-xl border border-rose-500/20">无法获取报告: 接口返回数据结构异常 \${d.error || ''}</div>\`;
+                    container.innerHTML = \`<div class="col-span-full text-center py-8 text-rose-400 bg-rose-500/10 rounded-xl border border-rose-500/20">无法获取报告: 接口返回数据结构异常 \${esc(d.error || '')}</div>\`;
                     return;
                 }
 
@@ -1142,35 +1187,35 @@ const DASHBOARD_HTML = (domain, webUser, webPass, proxyUser, proxyPass) => `
                 container.innerHTML = \`
                     <div class="col-span-full bg-slate-800/60 border border-slate-700/80 p-5 rounded-2xl flex flex-wrap gap-4 justify-between items-center mb-2 shadow-lg">
                         <div class="flex items-center gap-4">
-                            <span class="text-3xl font-extrabold font-mono text-white tracking-tight drop-shadow-sm">\${ip}</span>
+                            <span class="text-3xl font-extrabold font-mono text-white tracking-tight drop-shadow-sm">\${esc(ip)}</span>
                             <span class="text-slate-400 text-sm hidden sm:flex items-center border-l border-slate-700 pl-4 h-6">
-                                <span class="uppercase tracking-widest text-indigo-400 mr-2 text-xs font-bold">\${d.geo.country_code || 'N/A'}</span> 
-                                \${locStr} · \${orgStr}
+                                <span class="uppercase tracking-widest text-indigo-400 mr-2 text-xs font-bold">\${esc(d.geo.country_code || 'N/A')}</span>
+                                \${esc(locStr)} · \${esc(orgStr)}
                             </span>
                         </div>
                     </div>
 
                     <div class="bg-slate-800/40 border border-slate-700/60 p-6 rounded-2xl flex flex-col gap-4 shadow-sm hover:shadow-md transition-shadow hover:bg-slate-800/60">
                         <h4 class="text-xs font-bold text-slate-500 uppercase tracking-widest pb-3 border-b border-slate-700/50">基础物理画像</h4>
-                        <div class="flex justify-between items-center"><span class="text-slate-400 text-sm">IP 原生性</span> <span class="font-medium text-sm">\${isNative ? '<span class="px-2.5 py-1 rounded-full bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 text-xs font-bold">原生 IP (Native)</span>' : \`<span class="px-2.5 py-1 rounded-full bg-amber-500/20 text-amber-400 border border-amber-500/30 text-xs font-bold">\${d.geo.native_type || '广播 IP'}</span>\`}</span></div>
+                        <div class="flex justify-between items-center"><span class="text-slate-400 text-sm">IP 原生性</span> <span class="font-medium text-sm">\${isNative ? '<span class="px-2.5 py-1 rounded-full bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 text-xs font-bold">原生 IP (Native)</span>' : \`<span class="px-2.5 py-1 rounded-full bg-amber-500/20 text-amber-400 border border-amber-500/30 text-xs font-bold">\${esc(d.geo.native_type || '广播 IP')}</span>\`}</span></div>
                         <div class="flex justify-between items-center"><span class="text-slate-400 text-sm">业务标记</span> <div class="flex gap-1">\${tags}</div></div>
                         <div class="flex justify-between items-center"><span class="text-slate-400 text-sm">运营类型</span> <span class="font-medium \${isHosting ? 'text-rose-400' : 'text-emerald-400'} text-sm">\${d.isp.type || '-'}</span></div>
-                        <div class="flex justify-between items-center"><span class="text-slate-400 text-sm">归属机构</span> <span class="font-medium text-slate-300 text-sm truncate max-w-[150px]" title="\${orgStr}">\${orgStr}</span></div>
+                        <div class="flex justify-between items-center"><span class="text-slate-400 text-sm">归属机构</span> <span class="font-medium text-slate-300 text-sm truncate max-w-[150px]" title="\${esc(orgStr)}">\${esc(orgStr)}</span></div>
                     </div>
 
                     <div class="bg-slate-800/40 border border-slate-700/60 p-6 rounded-2xl flex flex-col gap-4 shadow-sm hover:shadow-md transition-shadow hover:bg-slate-800/60">
                         <h4 class="text-xs font-bold text-slate-500 uppercase tracking-widest pb-3 border-b border-slate-700/50">ISP 网络底层</h4>
-                        <div class="flex justify-between items-center"><span class="text-slate-400 text-sm">ASN</span> <span class="font-medium text-indigo-300 text-sm font-mono">\${d.isp.asn || '-'}</span></div>
-                        <div class="flex justify-between items-center"><span class="text-slate-400 text-sm">解析时区</span> <span class="font-medium text-slate-300 text-sm font-mono">\${d.geo.timezone || '-'}</span></div>
-                        <div class="flex justify-between items-center"><span class="text-slate-400 text-sm">偏移量 (Drift)</span> <span class="font-medium \${d.geo.has_drift ? 'text-rose-400' : 'text-emerald-400'} text-sm">\${d.geo.drift_km || 0} km</span></div>
-                        <div class="flex justify-between items-center"><span class="text-slate-400 text-sm">反向 DNS (rDNS)</span> <span class="font-medium text-slate-400 text-xs font-mono truncate max-w-[150px]" title="\${d.isp.rdns || '-'}">\${d.isp.rdns || '-'}</span></div>
+                        <div class="flex justify-between items-center"><span class="text-slate-400 text-sm">ASN</span> <span class="font-medium text-indigo-300 text-sm font-mono">\${esc(d.isp.asn || '-')}</span></div>
+                        <div class="flex justify-between items-center"><span class="text-slate-400 text-sm">解析时区</span> <span class="font-medium text-slate-300 text-sm font-mono">\${esc(d.geo.timezone || '-')}</span></div>
+                        <div class="flex justify-between items-center"><span class="text-slate-400 text-sm">偏移量 (Drift)</span> <span class="font-medium \${d.geo.has_drift ? 'text-rose-400' : 'text-emerald-400'} text-sm">\${esc(d.geo.drift_km || 0)} km</span></div>
+                        <div class="flex justify-between items-center"><span class="text-slate-400 text-sm">反向 DNS (rDNS)</span> <span class="font-medium text-slate-400 text-xs font-mono truncate max-w-[150px]" title="\${esc(d.isp.rdns || '-')}">\${esc(d.isp.rdns || '-')}</span></div>
                     </div>
 
                     <div class="bg-slate-800/40 border border-slate-700/60 p-6 rounded-2xl flex flex-col gap-4 shadow-sm hover:shadow-md transition-shadow hover:bg-slate-800/60">
                         <h4 class="text-xs font-bold text-slate-500 uppercase tracking-widest pb-3 border-b border-slate-700/50">风险深度检测</h4>
                         <div class="flex justify-between items-center"><span class="text-slate-400 text-sm">Spamhaus 情报</span> <span class="\${threat ? 'px-2.5 py-1 rounded-full bg-rose-500/20 text-rose-400 border border-rose-500/30 text-xs font-bold' : 'px-2.5 py-1 rounded-full bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 text-xs font-bold'}">\${threat ? '🚨 已在黑名单' : '✅ 纯净无异常'}</span></div>
-                        <div class="flex justify-between items-center"><span class="text-slate-400 text-sm">代理/机房特征</span> <span class="font-medium text-xs font-bold \${d.isp.warning ? 'text-amber-400' : 'text-emerald-400'} truncate max-w-[150px]" title="\${d.isp.warning || ''}">\${d.isp.warning || '未检测到明显异常'}</span></div>
-                        <div class="flex justify-between items-center"><span class="text-slate-400 text-sm">数据源</span> <span class="font-medium text-slate-400 text-xs">\${d.data_source || 'Unknown'}</span></div>
+                        <div class="flex justify-between items-center"><span class="text-slate-400 text-sm">代理/机房特征</span> <span class="font-medium text-xs font-bold \${d.isp.warning ? 'text-amber-400' : 'text-emerald-400'} truncate max-w-[150px]" title="\${esc(d.isp.warning || '')}">\${esc(d.isp.warning || '未检测到明显异常')}</span></div>
+                        <div class="flex justify-between items-center"><span class="text-slate-400 text-sm">数据源</span> <span class="font-medium text-slate-400 text-xs">\${esc(d.data_source || 'Unknown')}</span></div>
                     </div>
                 \`;
             } catch (e) {
@@ -1212,9 +1257,9 @@ const DASHBOARD_HTML = (domain, webUser, webPass, proxyUser, proxyPass) => `
                             
                             return \`
                             <div class="inline-flex items-center bg-slate-950 border border-slate-800/80 rounded-xl px-2.5 py-1.5 shadow-inner">
-                                <span class="bg-slate-800 text-slate-300 font-mono text-xs px-2 py-0.5 rounded-md mr-3 border border-slate-700 font-bold">\${d.tunnel}</span>
-                                <span class="bg-indigo-500/20 text-indigo-400 font-bold font-mono text-xs px-2 py-0.5 rounded-md mr-3 border border-indigo-500/20">\${d.country}</span>
-                                <span class="font-mono text-slate-300 text-sm tracking-wide mr-3" title="出口物理 IP">\${d.node_ip || '---.---.---.---'}:\${d.port}</span>
+                                <span class="bg-slate-800 text-slate-300 font-mono text-xs px-2 py-0.5 rounded-md mr-3 border border-slate-700 font-bold">\${esc(d.tunnel)}</span>
+                                <span class="bg-indigo-500/20 text-indigo-400 font-bold font-mono text-xs px-2 py-0.5 rounded-md mr-3 border border-indigo-500/20">\${esc(d.country)}</span>
+                                <span class="font-mono text-slate-300 text-sm tracking-wide mr-3" title="出口物理 IP">\${esc(d.node_ip || '---.---.---.---')}:\${esc(d.port)}</span>
                                 <span class="flex items-center gap-1.5 \${textColorClass} \${bgColorClass} px-2 py-0.5 rounded-md border \${borderColorClass} text-xs font-medium">
                                     <span class="w-1.5 h-1.5 rounded-full \${statusColorClass} shadow-[0_0_5px_currentColor]"></span> \${statusText}
                                 </span>
@@ -1227,7 +1272,7 @@ const DASHBOARD_HTML = (domain, webUser, webPass, proxyUser, proxyPass) => `
                             <td class="py-5 px-6 font-mono text-indigo-300 align-middle">
                                 <div class="flex items-center gap-2">
                                     <svg class="w-4 h-4 text-slate-600 group-hover:text-indigo-400 transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 12h14M5 12a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v4a2 2 0 01-2 2M5 12a2 2 0 00-2 2v4a2 2 0 002 2h14a2 2 0 002-2v-4a2 2 0 00-2-2m-2-4h.01M17 16h.01"></path></svg>
-                                    \${server.ip}
+                                    \${esc(server.ip)}
                                 </div>
                             </td>
                             <td class="py-5 px-6 align-middle">\${proxyBadges}</td>
