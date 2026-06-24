@@ -1,5 +1,8 @@
 // ======  Proxy Controller (Active-Standby Multi-Tunnel) ======
 
+// #15 模块级标志：同一 isolate 内只初始化一次表结构
+let dbInitialized = false;
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -50,28 +53,7 @@ export default {
       });
     };
 
-    await env.DB.prepare(`
-      CREATE TABLE IF NOT EXISTS servers (
-        ip TEXT PRIMARY KEY,
-        details TEXT,
-        last_seen INTEGER
-      )
-    `).run();
-
-    await env.DB.prepare(`
-      CREATE TABLE IF NOT EXISTS server_logs (
-        ip TEXT PRIMARY KEY,
-        logs TEXT,
-        updated_at INTEGER
-      )
-    `).run();
-
-    await env.DB.prepare(`
-      CREATE TABLE IF NOT EXISTS global_config (
-        key TEXT PRIMARY KEY,
-        value TEXT
-      )
-    `).run();
+    // #15 表初始化已下移至认证检查之后（dbInitialized），避免每个未认证请求触发 3 次 D1 写入
 
     if (url.pathname === "/scripts/proxy_server.py") {
       const PROXY_CODE = `#!/usr/bin/env python3
@@ -248,7 +230,7 @@ def start_proxy_server(host: str, port: int) -> None:
 
     if (url.pathname === "/scripts/lite_manager.py") {
       const MANAGER_CODE = `#!/usr/bin/env python3
-import base64, csv, os, subprocess, threading, time, urllib.request, json
+import base64, csv, os, re, subprocess, threading, time, urllib.request, json
 from pathlib import Path
 import proxy_server
 
@@ -467,7 +449,9 @@ def connect_node(tun: Tunnel, node: dict):
     try:
         cfg_path = CONFIG_DIR / f"{tun.name}.ovpn"
         log_file = WORKSPACE / f"{tun.name}_err.log"
-        cfg_path.write_text(node["config"], encoding="utf-8")
+        # #26 清洗会劫持宿主默认路由的静态指令（--route-nopull 只挡服务端 push，挡不住 config body 里的静态 redirect-gateway，会导致 VPS SSH 断连）
+        clean_cfg = re.sub(r'(?m)^[ \t]*redirect-gateway\b.*$', '', node["config"])
+        cfg_path.write_text(clean_cfg, encoding="utf-8")
         
         ovpn_version = subprocess.run(["openvpn", "--version"], capture_output=True, text=True).stdout
         cipher_args = ["--ncp-ciphers", "AES-128-CBC:AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305"] if "2.4" in ovpn_version else ["--data-ciphers", "AES-128-CBC:AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305", "--data-ciphers-fallback", "AES-128-CBC"]
@@ -722,7 +706,7 @@ def maintain_pool():
                     with state_lock: tun_main.is_connecting = True
                     threading.Thread(target=connect_node, args=(tun_main, node,), daemon=True).start()
                     time.sleep(1)
-            elif needs_backup:
+            if needs_backup:
                 node = get_best_candidate()
                 if node:
                     with state_lock: tun_backup.is_connecting = True
@@ -737,7 +721,7 @@ def main():
     if os.geteuid() != 0: return
     get_public_ip()
     setup_env()
-    subprocess.run(["pkill", "-f", "openvpn.*tun_main|tun_backup"], capture_output=True)
+    subprocess.run(["pkill", "-f", r"openvpn.*tun_(main|backup)"], capture_output=True)
     
     proxy_server.ACTIVE_BIND = tun_main.name
     
@@ -817,7 +801,13 @@ echo "[+] 引擎更新成功！主备双活通道、异步刷IP逻辑已全量�
 
     if (url.pathname.startsWith("/api/testisp-lookup/")) {
         if (!authenticate(request)) return unauthorizedResponse();
-        const targetIp = url.pathname.replace("/api/testisp-lookup/", "");
+        const targetIp = decodeURIComponent(url.pathname.replace("/api/testisp-lookup/", ""));
+        // #11 校验合法 IPv4/IPv6，防止参数注入与 SSRF
+        const isIPv4 = /^(\d{1,3}\.){3}\d{1,3}$/.test(targetIp);
+        const isIPv6 = targetIp.includes(":") && /^[0-9a-fA-F:]+$/.test(targetIp);
+        if (!isIPv4 && !isIPv6) {
+            return new Response("Invalid IP", { status: 400 });
+        }
         try {
             const reqUrl = `https://testisp.info/api/check?ip=${targetIp}`;
             const resp = await fetch(reqUrl, {
@@ -867,6 +857,14 @@ echo "[+] 引擎更新成功！主备双活通道、异步刷IP逻辑已全量�
       if (!authenticate(request)) return unauthorizedResponse();
     }
 
+    // #15 表初始化移到认证之后，且用模块级标志避免同一 isolate 重复建表（原方案每个请求含扫描器都触发 3 次 D1 写入）
+    if (!dbInitialized) {
+      await env.DB.prepare(`CREATE TABLE IF NOT EXISTS servers (ip TEXT PRIMARY KEY, details TEXT, last_seen INTEGER)`).run();
+      await env.DB.prepare(`CREATE TABLE IF NOT EXISTS server_logs (ip TEXT PRIMARY KEY, logs TEXT, updated_at INTEGER)`).run();
+      await env.DB.prepare(`CREATE TABLE IF NOT EXISTS global_config (key TEXT PRIMARY KEY, value TEXT)`).run();
+      dbInitialized = true;
+    }
+
     if (url.pathname === "/api/config" && request.method === "GET") {
         const { results } = await env.DB.prepare(`SELECT value FROM global_config WHERE key = 'slot_map'`).all();
         if (results && results.length > 0) return new Response(results[0].value, { headers: { "Content-Type": "application/json" } });
@@ -887,6 +885,9 @@ echo "[+] 引擎更新成功！主备双活通道、异步刷IP逻辑已全量�
     if (url.pathname === "/api/report" && request.method === "POST") {
       try {
         const data = await request.json();
+        // #20 过期节点清理移到写路径，避免 GET /api/proxies、/api/nodes 每次轮询触发写入（原每天 1.7 万次写）
+        const cutoff = Date.now() - 120000;
+        await env.DB.prepare(`DELETE FROM servers WHERE last_seen < ?1`).bind(cutoff).run();
         await env.DB.prepare(`INSERT INTO servers (ip, details, last_seen) VALUES (?1, ?2, ?3) ON CONFLICT(ip) DO UPDATE SET details = excluded.details, last_seen = excluded.last_seen`).bind(data.ip, JSON.stringify(data.details || []), Date.now()).run();
         if (data.logs) {
           await env.DB.prepare(`INSERT INTO server_logs (ip, logs, updated_at) VALUES (?1, ?2, ?3) ON CONFLICT(ip) DO UPDATE SET logs = excluded.logs, updated_at = excluded.updated_at`).bind(data.ip, data.logs, Date.now()).run();
@@ -896,8 +897,6 @@ echo "[+] 引擎更新成功！主备双活通道、异步刷IP逻辑已全量�
     }
 
     if (url.pathname === "/api/proxies") {
-      const cutoff = Date.now() - 120000;
-      await env.DB.prepare(`DELETE FROM servers WHERE last_seen < ?1`).bind(cutoff).run();
       const { results } = await env.DB.prepare(`SELECT ip, details FROM servers`).all();
       let proxyList = [];
       if (results) {
@@ -913,8 +912,6 @@ echo "[+] 引擎更新成功！主备双活通道、异步刷IP逻辑已全量�
     }
 
     if (url.pathname === "/api/nodes") {
-      const cutoff = Date.now() - 120000;
-      await env.DB.prepare(`DELETE FROM servers WHERE last_seen < ?1`).bind(cutoff).run();
       const { results } = await env.DB.prepare(`
         SELECT s.*, l.logs 
         FROM servers s 
