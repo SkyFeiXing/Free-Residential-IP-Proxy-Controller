@@ -58,7 +58,7 @@ export default {
     if (url.pathname === "/scripts/proxy_server.py") {
       const PROXY_CODE = `#!/usr/bin/env python3
 from __future__ import annotations
-import select, socket, threading, urllib.parse, time, base64, hmac
+import select, socket, threading, urllib.parse, time, base64, hmac, struct
 from typing import Any
 
 PROXY_USER = b"${PROXY_USER}"
@@ -100,15 +100,29 @@ def create_connection(address: tuple[str, int], timeout: float = 20) -> socket.s
     raise err or OSError("getaddrinfo empty")
 
 def relay(left: socket.socket, right: socket.socket) -> None:
-    sockets = [left, right]
-    while True:
-        readable, _, errored = select.select(sockets, [], sockets, 120)
+    # #13 设置写超时，防止慢消费端让 sendall 无限阻塞撑爆内存
+    for _s in (left, right):
+        try: _s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDTIMEO, struct.pack('ll', 60, 0))
+        except: pass
+    peers = {left: right, right: left}
+    socks = [left, right]
+    while socks:
+        readable, _, errored = select.select(socks, [], socks, 120)
         if errored: return
         for source in readable:
-            target = right if source is left else left
-            data = source.recv(65536)
-            if not data: return
-            target.sendall(data)
+            target = peers.get(source)
+            if target is None: continue
+            try: data = source.recv(65536)
+            except: data = b""
+            if not data:
+                # #13 半关闭：一方 EOF 仅关闭对端写端，继续转发另一方向的剩余数据
+                try: target.shutdown(socket.SHUT_WR)
+                except: pass
+                socks = [s for s in socks if s is not source]
+                peers.pop(source, None)
+                continue
+            try: target.sendall(data)
+            except: return
 
 def socks5_client(client: socket.socket, first_byte: bytes) -> None:
     upstream = None
@@ -338,7 +352,14 @@ def update_config_loop():
                 new_port = int(data.get("port", 7920))
                 
                 if new_port != PROXY_PORT:
-                    print(f"[*] 收到端口变更指令 ({PROXY_PORT} -> {new_port})，重启守护进程...", flush=True)
+                    print(f"[*] 收到端口变更指令 ({PROXY_PORT} -> {new_port})，主动清理隧道后重启守护进程...", flush=True)
+                    # #14 os._exit 前主动终止 openvpn 子进程避免孤儿（daemon 线程中 sys.exit 无法终止整个进程，故保留 os._exit 并补齐清理）
+                    with state_lock:
+                        for _tun in (tun_main, tun_backup):
+                            if _tun.process:
+                                try: _tun.process.terminate()
+                                except: pass
+                    time.sleep(1)
                     os._exit(0)
                 
                 with state_lock:
@@ -351,12 +372,16 @@ def update_config_loop():
                         if tun_main.entry_ip: blacklist_node(tun_main.entry_ip, tun_main.country)
                         if tun_main.process:
                             try: tun_main.process.terminate(); tun_main.process.wait(2)
-                            except: tun_main.process.kill()
+                            except Exception:
+                                try: tun_main.process.kill()
+                                except Exception: pass
                         tun_main.ready = False; tun_main.process = None; tun_main.entry_ip = ""; tun_main.egress_ip = ""
                         
                         if tun_backup.process:
                             try: tun_backup.process.terminate(); tun_backup.process.wait(2)
-                            except: tun_backup.process.kill()
+                            except Exception:
+                                try: tun_backup.process.kill()
+                                except Exception: pass
                         tun_backup.ready = False; tun_backup.process = None; tun_backup.entry_ip = ""; tun_backup.egress_ip = ""
                         
                         last_switch_trigger = switch_trigger
@@ -405,16 +430,19 @@ def harvest_snapshot_nodes() -> list:
         if lines and lines[0].startswith("#"): lines[0] = lines[0][1:]
         nodes = []
         for row in csv.DictReader(lines):
-            ip = row.get("IP")
-            if not ip or not row.get("OpenVPN_ConfigData_Base64"): continue
-            raw_ping = row.get("Ping", "")
-            nodes.append({
-                "ip": ip, 
-                "ping": int(raw_ping) if raw_ping.isdigit() else 9999, 
-                "country": row.get("CountryShort", "").upper(), 
-                "config": base64.b64decode(row["OpenVPN_ConfigData_Base64"]).decode("utf-8", errors="replace"),
-                "harvested_at": time.time()
-            })
+            try:
+                ip = row.get("IP")
+                if not ip or not row.get("OpenVPN_ConfigData_Base64"): continue
+                raw_ping = row.get("Ping", "")
+                nodes.append({
+                    "ip": ip, 
+                    "ping": int(raw_ping) if raw_ping.isdigit() else 9999, 
+                    "country": row.get("CountryShort", "").upper(), 
+                    "config": base64.b64decode(row["OpenVPN_ConfigData_Base64"]).decode("utf-8", errors="replace"),
+                    "harvested_at": time.time()
+                })
+            except Exception:
+                continue  # #23 单行解析失败跳过，不影响整批快照（原实现一个坏 base64 会丢全部节点）
         return nodes
     except Exception as e: return []
 
@@ -481,7 +509,7 @@ def connect_node(tun: Tunnel, node: dict):
             # --- 穿透获取通道真实出口 IP ---
             true_ip = ""
             try:
-                true_ip_res = subprocess.run(["curl", "-s", "-m", "10", "--interface", tun.name, "https://api.ipify.org"], capture_output=True, text=True)
+                true_ip_res = subprocess.run(["curl", "-s", "-m", "5", "--interface", tun.name, "https://api.ipify.org"], capture_output=True, text=True)
                 candidate_ip = true_ip_res.stdout.strip()
                 if candidate_ip and candidate_ip.count('.') == 3:
                     true_ip = candidate_ip
@@ -492,35 +520,46 @@ def connect_node(tun: Tunnel, node: dict):
             if true_ip and true_ip != node['ip']:
                 print(f"[*] {tun.name} 探测到真实出口 IP 与入口不一致: 入口 {node['ip']} -> 出口 {true_ip}", flush=True)
 
-            is_residential = True
-            try:
-                # 兼容 testisp.info/api/check 的新解析逻辑
-                req_url = f"https://testisp.info/api/check?ip={egress_ip}"
-                check_req = urllib.request.Request(req_url, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"}, method="GET")
-                with urllib.request.urlopen(check_req, timeout=10) as check_res:
-                    data = json.loads(check_res.read().decode("utf-8"))
-                    isp_flag = str(data.get("isp", {}).get("flag", "")).lower()
-                    
-                    if isp_flag == "hosting":
-                        is_residential = False
-            except Exception as e: pass
-            
-            if not is_residential:
-                print(f"[-] {tun.name} 节点出口 ({egress_ip}) 检测为机房 IP，残忍抛弃！", flush=True)
-                penalize_node(node["ip"], 50000)  # 机房 IP 极重惩罚，几乎不再启用
+            # #24 质检并行化：TestISP 与 YouTube 同时执行，缩短隧道槽位占用（原串行 ~15s → 并行 ~8s）
+            qc = {"residential": True, "yt_ok": True}
+
+            def _check_isp():
+                try:
+                    req_url = f"https://testisp.info/api/check?ip={egress_ip}"
+                    check_req = urllib.request.Request(req_url, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"}, method="GET")
+                    with urllib.request.urlopen(check_req, timeout=8) as check_res:
+                        data = json.loads(check_res.read().decode("utf-8"))
+                        if str(data.get("isp", {}).get("flag", "")).lower() == "hosting":
+                            qc["residential"] = False
+                except Exception: pass
+
+            def _check_yt():
+                try:
+                    res = subprocess.run(["curl", "-I", "-s", "-A", "Mozilla/5.0", "-m", "5", "--interface", tun.name, "https://www.youtube.com"], capture_output=True, timeout=8)
+                    if res.returncode != 0: qc["yt_ok"] = False
+                except Exception: qc["yt_ok"] = False
+
+            print(f"[*] {tun.name} 并行深度质检 (TestISP + YouTube)...", flush=True)
+            t_isp = threading.Thread(target=_check_isp); t_yt = threading.Thread(target=_check_yt)
+            t_isp.start(); t_yt.start()
+            t_isp.join(10); t_yt.join(7)
+
+            def _abort_node(reason: str, penalty: int):
+                """质检失败统一清理：惩罚 + 拉黑 + 终止 openvpn（#18 防 kill 二次异常）"""
+                print(f"[-] {tun.name} {reason}: {node['ip']}", flush=True)
+                penalize_node(node["ip"], penalty)
                 blacklist_node(node["ip"], node["country"])
                 try: process.terminate(); process.wait(2)
-                except: process.kill()
+                except Exception:
+                    try: process.kill()
+                    except Exception: pass
+
+            if not qc["residential"]:
+                _abort_node(f"节点出口 ({egress_ip}) 检测为机房 IP，残忍抛弃", 50000)
                 return
 
-            print(f"[*] {tun.name} 进行流媒体质检 (YouTube)...", flush=True)
-            res = subprocess.run(["curl", "-I", "-s", "-A", "Mozilla/5.0", "-m", "5", "--interface", tun.name, "https://www.youtube.com"], capture_output=True)
-            if res.returncode != 0:
-                print(f"[-] {tun.name} 节点出口无法连通 YouTube，拉黑更换: {node['ip']}", flush=True)
-                penalize_node(node["ip"], 10000)  # YT 连不通重罚
-                blacklist_node(node["ip"], node["country"])
-                try: process.terminate(); process.wait(2)
-                except: process.kill()
+            if not qc["yt_ok"]:
+                _abort_node("节点出口无法连通 YouTube，拉黑更换", 10000)
                 return
 
             # #3 代际校验：隧道对调后身份变更则放弃写入，避免幽灵隧道
@@ -548,7 +587,9 @@ def connect_node(tun: Tunnel, node: dict):
         else:
             penalize_node(node["ip"], 5000)  # 建连超时中度惩罚
             try: process.terminate(); process.wait(2)
-            except: process.kill()
+            except Exception:
+                try: process.kill()
+                except Exception: pass
             blacklist_node(node["ip"], node["country"])
     finally:
         with state_lock: tun.is_connecting = False
@@ -611,7 +652,9 @@ def health_check_loop():
                 penalize_node(target_entry_ip, 3000) # 运行中死掉的节点给予轻中度惩罚
                 blacklist_node(target_entry_ip, tun_main.country)
                 try: proc_ref.terminate(); proc_ref.wait(timeout=2)
-                except: proc_ref.kill()
+                except Exception:
+                    try: proc_ref.kill()
+                    except Exception: pass
                 with state_lock:
                     if tun_main.process == proc_ref: tun_main.ready = False
                 fail_count = 0
@@ -685,14 +728,18 @@ def maintain_pool():
                         # 异步清理死掉的旧主卡 (现在的 tun_backup)
                         if tun_backup.process:
                             try: tun_backup.process.terminate(); tun_backup.process.wait(2)
-                            except: tun_backup.process.kill()
+                            except Exception:
+                                try: tun_backup.process.kill()
+                                except Exception: pass
                         tun_backup.process = None; tun_backup.node = None; tun_backup.entry_ip = ""; tun_backup.egress_ip = ""
                         tun_backup.ready = False; tun_backup.is_connecting = False
                         tun_backup.generation += 1  # #3 递增代际，使进行中的 connect_node 放弃写入
                     else:
                         if tun_main.process:
                             try: tun_main.process.terminate(); tun_main.process.wait(2)
-                            except: tun_main.process.kill()
+                            except Exception:
+                                try: tun_main.process.kill()
+                                except Exception: pass
                         tun_main.process = None; tun_main.ready = False; tun_main.is_connecting = False
                         tun_main.entry_ip = ""; tun_main.egress_ip = ""
 
@@ -981,11 +1028,11 @@ const DASHBOARD_HTML = (domain, webUser, webPass, proxyUser, proxyPass) => `
                 <div class="flex gap-4 text-xs font-mono">
                     <div class="bg-slate-900/50 border border-slate-800 rounded-lg px-3 py-2 flex-1 flex justify-between items-center shadow-sm">
                         <span class="text-slate-500">面板凭证</span>
-                        <span class="text-indigo-300 font-bold ml-4">${webUser} <span class="text-slate-600">/</span> ${webPass}</span>
+                        <span class="text-indigo-300 font-bold ml-4">${webUser} <span class="text-slate-600">/</span> •••••• <span class="text-slate-600 text-[10px]">(见 CF 环境变量)</span></span>
                     </div>
                     <div class="bg-slate-900/50 border border-slate-800 rounded-lg px-3 py-2 flex-1 flex justify-between items-center shadow-sm">
                         <span class="text-slate-500">代理凭证</span>
-                        <span class="text-amber-300 font-bold ml-4">${proxyUser} <span class="text-slate-600">/</span> ${proxyPass}</span>
+                        <span class="text-amber-300 font-bold ml-4">${proxyUser} <span class="text-slate-600">/</span> •••••• <span class="text-slate-600 text-[10px]">(见 CF 环境变量)</span></span>
                     </div>
                 </div>
             </div>
