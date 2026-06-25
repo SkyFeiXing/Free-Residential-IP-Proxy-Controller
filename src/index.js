@@ -585,7 +585,11 @@ def update_config_loop():
                         last_switch_trigger = switch_trigger
         except Exception as e:
             # M5: 记录配置拉取异常，避免故障静默
-            print(f"[!] update_config_loop 异常: {type(e).__name__}: {e}", flush=True)
+            body = ""
+            if hasattr(e, 'read'):
+                try: body = e.read().decode("utf-8", errors="replace")[:200]
+                except: pass
+            print(f"[!] update_config_loop 异常: {type(e).__name__}: {e} | {body}", flush=True)
         time.sleep(15)
 
 def c2_heartbeat_loop():
@@ -612,7 +616,11 @@ def c2_heartbeat_loop():
             urllib.request.urlopen(req, timeout=10)
         except Exception as e:
             # M5: 心跳上报失败记录，便于发现 C2 连通性问题
-            print(f"[!] c2_heartbeat_loop 上报异常: {type(e).__name__}: {e}", flush=True)
+            body = ""
+            if hasattr(e, 'read'):
+                try: body = e.read().decode("utf-8", errors="replace")[:200]
+                except: pass
+            print(f"[!] c2_heartbeat_loop 上报异常: {type(e).__name__}: {e} | {body}", flush=True)
         time.sleep(8)
 
 def setup_env():
