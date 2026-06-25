@@ -892,8 +892,9 @@ def get_best_candidate():
         pool_snapshot = list(global_node_reservoir.values())
         dead_snap = dict(dead_ips)
         active_ips = []
-        if tun_main.entry_ip: active_ips.append(tun_main.entry_ip)
-        if tun_backup.entry_ip: active_ips.append(tun_backup.entry_ip)
+        for _t in (tun_main, tun_backup):
+            if _t.entry_ip: active_ips.append(_t.entry_ip)
+            elif _t.node and isinstance(_t.node, dict) and _t.node.get("ip"): active_ips.append(_t.node["ip"])
 
         candidates = [n for n in pool_snapshot if n["country"] == target_country and n["ip"] not in dead_snap.get(target_country, set())]
         candidates = [n for n in candidates if n["ip"] not in active_ips]
@@ -984,13 +985,17 @@ def maintain_pool():
             if needs_main:
                 node = get_best_candidate()
                 if node:
-                    with state_lock: tun_main.is_connecting = True
+                    with state_lock:
+                        tun_main.is_connecting = True
+                        tun_main.node = node
                     threading.Thread(target=connect_node, args=(tun_main, node,), daemon=True).start()
                     time.sleep(1)
             if needs_backup:
                 node = get_best_candidate()
                 if node:
-                    with state_lock: tun_backup.is_connecting = True
+                    with state_lock:
+                        tun_backup.is_connecting = True
+                        tun_backup.node = node
                     threading.Thread(target=connect_node, args=(tun_backup, node,), daemon=True).start()
         except Exception as e:
             # #1 兜底保护：任何异常都不让核心调度线程死亡（否则系统进入无告警的僵尸态）
