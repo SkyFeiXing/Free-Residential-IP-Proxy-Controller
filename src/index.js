@@ -1038,7 +1038,7 @@ echo "net.ipv4.conf.all.rp_filter=2" > /etc/sysctl.d/99-proxy-lite.conf
 echo "net.ipv4.conf.default.rp_filter=2" >> /etc/sysctl.d/99-proxy-lite.conf
 sysctl --system >/dev/null 2>&1 || true
 
-apt-get update -q
+apt-get update -q || true
 apt-get install -y openvpn python3 curl iproute2 iptables cron psmisc
 
 mkdir -p /opt/proxy_lite/configs
