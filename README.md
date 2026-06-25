@@ -69,7 +69,7 @@ wget -N https://gitlab.com/fscarmen/warp/-/raw/main/menu.sh && bash menu.sh
    * 在 `D1 Database Bindings` 处添加绑定。
    * **Variable name** 必须严格填入：`DB`
    * **D1 Database** 选择第一步创建的 `proxy-db`。
-4. **配置环境变量 (Environment Variables)**（必须设置！！！不填则使用系统弱口令，极易被扫描器爆破）：
+4. **配置环境变量 (Environment Variables)**（**强制安全要求**：保持默认口令将触发安全锁定，Worker 拒绝提供任何服务并返回告警页！必须修改以下 WEB 与 PROXY 两组口令。系统另内置按 IP 的暴力破解熔断，连续失败将返回 429）：
 
 | 变量名 | 默认值 | 作用说明 |
 | --- | --- | --- |
@@ -84,18 +84,19 @@ wget -N https://gitlab.com/fscarmen/warp/-/raw/main/menu.sh && bash menu.sh
 
 准备一台干净的 Linux VPS（推荐 Ubuntu 20.04/22.04 或 Debian 11/12 系统），通过 SSH 以 `root` 身份登录。
 
-访问您刚才部署的 Cloudflare Worker 域名（需输入配置的 `WEB_USER` 和 `WEB_PASS` 进行 Basic Auth 认证）。在面板右上角复制自动生成的纳管命令并执行：
+访问您刚才部署的 Cloudflare Worker 域名（需输入配置的 `WEB_USER` 和 `WEB_PASS` 进行 Basic Auth 认证）。在面板右上角复制自动生成的**纳管命令**（已内置一次性令牌 `SCRT`）并执行：
 
 ```bash
-bash <(curl -sL (https://您的worker域名.workers.dev/agent))
-
+export SCRT="面板生成的令牌" && bash <(curl -fsSL https://您的worker域名.workers.dev/agent)
 ```
+
+> ⚠️ **命令已升级（务必整行从面板复制）**：新版纳管命令携带一次性令牌 `SCRT`，用于授权 Agent 安全拉取引擎脚本，杜绝面板凭据通过脚本端点泄露。缺失或过期令牌将拉取失败。
 
 脚本将自动执行以下操作：
 
 1. 修复 Linux 内核 `rp_filter`（防止双网卡路由回包丢弃）。
 2. 安装 OpenVPN 核心包及相关依赖。
-3. 从 C2 控制端拉取最新版本的双活调度引擎（`lite_manager.py` / `proxy_server.py`）。
+3. 凭令牌从 C2 控制端安全拉取最新版本的双活调度引擎（`lite_manager.py` / `proxy_server.py`）。
 4. 配置并启动 `proxy-lite.service` 系统级守护进程。
 
 ---
@@ -162,6 +163,42 @@ rm -rf /opt/proxy_lite
 echo "✅ 双活代理引擎及所有配置已彻底卸载清理完毕！"
 
 ```
+
+---
+
+## 🔒 安全加固说明
+
+本系统已针对公网部署场景完成多轮安全加固，以下变更**会影响部署与使用行为**，请务必知悉：
+
+### 一、凭据安全（部署前必读）
+
+* **默认口令即锁定**：未修改 `WEB_PASS`（默认 `admin888`）或 `PROXY_PASS`（默认 `888888`）任意一个，Worker 将**拒绝提供任何服务**并返回安全告警页。必须在 Cloudflare 控制台 **Settings → Variables** 修改后才能启用。
+* **按 IP 暴力破解熔断**：连续认证失败（60 秒窗口内 10 次）将对该来源 IP 返回 `429 Too Many Requests`，防字典爆破。
+* **凭证安全转义**：`WEB_*` / `PROXY_*` 凭证即使包含 `"`、`\` 等特殊字符，也能正确下发到 VPS 脚本，不会导致脚本损坏或代码注入。
+
+### 二、一次性纳管令牌（SCRT）
+
+* 面板右上角的纳管命令内置一次性令牌 `SCRT`，Agent 凭它拉取引擎脚本。
+* `/scripts/*.py` 端点**必须携带 `Authorization: Bearer <令牌>`**，否则返回 403，从根本上避免 `WEB_USER`/`WEB_PASS` 通过脚本端点明文泄露。
+* **令牌轮换**：如需强制重置，删除 D1 `global_config` 表中 `key = 'script_token'` 的记录，下次访问面板根路径将自动生成新令牌。
+* **老用户升级**：覆盖新代码后，需重新从面板复制**新版纳管命令**（带 SCRT）到 VPS 执行；旧版 `bash <(curl …/agent)` 不再可用。
+
+### 三、输入校验与防注入
+
+| 加固点 | 说明 |
+| --- | --- |
+| 代理导出防劫持 | VPS 上报的 IP 与端口经严格校验（合法 IPv4/IPv6 + 端口 1–65535），杜绝伪造 IP 劫持 `/api/proxies` 导出的代理地址。 |
+| 国家代码校验 | 下发策略的 `0` 字段只接受 2 字母 A-Z，非法回退 `JP`。 |
+| SSRF 防护 | `/api/testisp-lookup/<ip>` 强制校验 IP 合法性，拒绝参数注入。 |
+| 存储型 XSS 防御 | 前端所有外部数据经 `esc()` 转义渲染；面板响应注入 `Content-Security-Policy` 等 HTTP 安全头作为纵深防御。 |
+
+### 四、稳定性与资源保护
+
+* **代理并发上限**：单台 VPS 同时处理 512 个代理连接，超限立即拒绝，防止慢速/海量连接耗尽线程（DoS 防护）。
+* **D1 读放大抑制**：`/api/nodes` 接入 4 秒短缓存，面板在后台标签页时自动暂停轮询，显著降低 D1 读取配额消耗。
+* **日志膨胀抑制**：openvpn 运行日志降级为 `--verb 2` 并在连接成功后清理 `_err.log`，避免长期撑爆 VPS 磁盘。
+* **健康探针优化**：隧道存活检测改用原生 socket 建连，替代每轮 fork 多个 `curl` 子进程，降低 CPU 开销。
+* **调度健壮性**：节点蓄水池排序移出锁外、黑名单不再全局定时清空（避免机房 IP 反复重试）、核心循环异常全部落日志。
 
 ---
 
