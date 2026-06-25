@@ -568,19 +568,20 @@ def update_config_loop():
                         else: print(f"[*] 策略热切换: 目标重定向到 {desired_country}...", flush=True)
                         
                         if tun_main.entry_ip: blacklist_node(tun_main.entry_ip, tun_main.country)
+                        if tun_backup.entry_ip: blacklist_node(tun_backup.entry_ip, tun_backup.country)
                         if tun_main.process:
                             try: tun_main.process.terminate(); tun_main.process.wait(2)
                             except Exception:
                                 try: tun_main.process.kill()
                                 except Exception: pass
-                        tun_main.ready = False; tun_main.process = None; tun_main.entry_ip = ""; tun_main.egress_ip = ""
+                        tun_main.ready = False; tun_main.is_connecting = False; tun_main.process = None; tun_main.node = None; tun_main.entry_ip = ""; tun_main.egress_ip = ""; tun_main.generation += 1
                         
                         if tun_backup.process:
                             try: tun_backup.process.terminate(); tun_backup.process.wait(2)
                             except Exception:
                                 try: tun_backup.process.kill()
                                 except Exception: pass
-                        tun_backup.ready = False; tun_backup.process = None; tun_backup.entry_ip = ""; tun_backup.egress_ip = ""
+                        tun_backup.ready = False; tun_backup.is_connecting = False; tun_backup.process = None; tun_backup.node = None; tun_backup.entry_ip = ""; tun_backup.egress_ip = ""; tun_backup.generation += 1
                         
                         last_switch_trigger = switch_trigger
         except Exception as e:
