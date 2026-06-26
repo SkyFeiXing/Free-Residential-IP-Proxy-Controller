@@ -453,7 +453,8 @@ WEB_PASS = ${pyStr(WEB_PASS)}
 
 PROXY_PORT = 7920
 target_country = "JP"
-last_switch_trigger = 0  
+last_switch_trigger = 0
+first_boot = True  # L1: 冷启动标志，首轮吸收持久化的 switch_trigger，避免每次重启误触发一次"强制更换"
 
 state_lock = threading.Lock()
 dead_ips = {}  # country -> set(ip)：按国家分桶黑名单（#2 熔断仅清当前国家，避免核弹级副作用）
@@ -539,7 +540,7 @@ def get_recent_logs():
     except: return "Waiting for logs..."
 
 def update_config_loop():
-    global target_country, last_switch_trigger, PROXY_PORT, tun_main, tun_backup
+    global target_country, last_switch_trigger, first_boot, PROXY_PORT, tun_main, tun_backup
     while True:
         try:
             req = urllib.request.Request(f"{C2_URL}/api/config", headers=get_c2_headers())
@@ -561,7 +562,16 @@ def update_config_loop():
                     os._exit(0)
                 
                 with state_lock:
-                    force_switch = (switch_trigger > last_switch_trigger)
+                    # L1: 冷启动首轮只吸收持久化的 switch_trigger，绝不触发强制清退（Bug 1 修复）。
+                    if first_boot:
+                        last_switch_trigger = switch_trigger
+                        first_boot = False
+                        if target_country != desired_country:
+                            target_country = desired_country
+                            print(f"[*] 冷启动策略初始化: 目标 {desired_country}", flush=True)
+                        force_switch = False
+                    else:
+                        force_switch = (switch_trigger > last_switch_trigger)
                     if target_country != desired_country or force_switch:
                         target_country = desired_country
                         if force_switch: print(f"[*] 收到强制更换指令，正在清退通道并拉黑当前 IP...", flush=True)
@@ -810,7 +820,10 @@ def connect_node(tun: Tunnel, node: dict):
                 except Exception: pass
             blacklist_node(node["ip"], node["country"])
     finally:
-        with state_lock: tun.is_connecting = False
+        # L2: 仅当本代连接(generation 未变)才释放单飞锁（Bug 4 修复）。
+        with state_lock:
+            if tun.generation == my_gen:
+                tun.is_connecting = False
 
 def health_check_loop():
     global tun_main, dead_ips
@@ -1282,7 +1295,7 @@ const DASHBOARD_HTML = async (domain, webUser, webPass, proxyUser, proxyPass, sc
                 </p>
             </div>
             
-            <div class="flex flex-col gap-3 w-full md:w-auto">
+            <div class="flex flex-col gap-3 w-full md:flex-1">
                 <div class="bg-slate-900/80 backdrop-blur-md border border-slate-700/50 rounded-xl overflow-hidden shadow-lg">
                     <div class="bg-slate-800/50 px-4 py-2 border-b border-slate-700/50 flex items-center gap-2">
                         <div class="flex gap-1.5">
