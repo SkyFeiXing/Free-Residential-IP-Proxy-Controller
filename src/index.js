@@ -904,11 +904,16 @@ def health_check_loop():
             except Exception:
                 try: s.close()
                 except Exception: pass
-        # 2. 容错评估与处决
+        # 2. 网络层：应用层全挂则尝试底层 ICMP 作为容错底线（住宅 IP 到国际端点可能偶尔抖动）
+        if not is_alive:
+            ping_res = subprocess.run(["ping", "-c", "2", "-W", "3", "-I", tname, "8.8.8.8"], capture_output=True)
+            if ping_res.returncode == 0:
+                is_alive = True
+        # 3. 容错评估与处决
         if not is_alive:
             fail[tname] += 1
             if fail[tname] >= 3:
-                print(f"[!] {tname} 连续 {fail[tname]} 次多维探针(HTTP)均无响应，确认为真死断流，执行踢线: {tip}", flush=True)
+                print(f"[!] {tname} 连续 {fail[tname]} 次多维探针(HTTP/ICMP)均无响应，确认为真死断流，执行踢线: {tip}", flush=True)
                 penalize_node(tip, 3000)
                 blacklist_node(tip, tcountry)
                 try: proc.terminate(); proc.wait(timeout=2)
