@@ -1045,7 +1045,7 @@ def maintain_pool():
 
                 if main_dead:
                     if tun_backup.ready and tun_backup.process and tun_backup.process.poll() is None and not tun_backup.is_connecting:
-                        print(f"[*] ⚡ 主通道暴毙，软开关秒切！无缝接管业务至备用通道: 出口 {tun_backup.egress_ip or tun_backup.entry_ip}", flush=True)
+                        print(f"[*] ⚡ 秒切！{tun_backup.name}({tun_backup.egress_ip or tun_backup.entry_ip}) 升级为主网卡（原主 {tun_main.name} 已断流降级清理）", flush=True)
                         # 状态互换 (身份对调)
                         tun_main, tun_backup = tun_backup, tun_main
                         proxy_server.ACTIVE_BIND = tun_main.name
