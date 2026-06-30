@@ -904,16 +904,11 @@ def health_check_loop():
             except Exception:
                 try: s.close()
                 except Exception: pass
-        # 2. 网络层：应用层全挂则尝试底层 ICMP 作为终极底线
-        if not is_alive:
-            ping_res = subprocess.run(["ping", "-c", "2", "-W", "3", "-I", tname, "8.8.8.8"], capture_output=True)
-            if ping_res.returncode == 0:
-                is_alive = True
-        # 3. 容错评估与处决
+        # 2. 容错评估与处决
         if not is_alive:
             fail[tname] += 1
             if fail[tname] >= 3:
-                print(f"[!] {tname} 连续 {fail[tname]} 次多维探针(HTTP/ICMP)均无响应，确认为真死断流，执行踢线: {tip}", flush=True)
+                print(f"[!] {tname} 连续 {fail[tname]} 次多维探针(HTTP)均无响应，确认为真死断流，执行踢线: {tip}", flush=True)
                 penalize_node(tip, 3000)
                 blacklist_node(tip, tcountry)
                 try: proc.terminate(); proc.wait(timeout=2)
@@ -926,7 +921,8 @@ def health_check_loop():
             else:
                 print(f"[*] {tname} 探针无响应，启动快频深度复核容错机制 ({fail[tname]}/3)...", flush=True)
         else:
-            fail[tname] = 0
+            # 成功时衰减而非归零：对抗偶发假阳性（如隧道半死状态下 TCP 握手偶通），累积趋势仍能触发踢线
+            fail[tname] = max(0, fail[tname] - 1)
 
     while True:
         # 任一隧道处于容错态时加快复核频率（保留原 5 秒快频语义）
